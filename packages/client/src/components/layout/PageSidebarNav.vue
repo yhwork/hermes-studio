@@ -49,6 +49,18 @@ function openWorkflow() {
   if (props.active === 'workflow') return
   void router.push({ name: 'hermes.workflow' })
 }
+
+function openSkills() {
+  void router.push({ name: 'hermes.skills' })
+}
+
+function openPlugins() {
+  void router.push({ name: 'hermes.plugins' })
+}
+
+function openMcp() {
+  void router.push({ name: 'hermes.mcp' })
+}
 </script>
 
 <template>
@@ -119,6 +131,30 @@ function openWorkflow() {
           <path d="M12 7v5l3 2" />
         </svg>
         <span>{{ historyButtonLabel }}</span>
+      </button>
+      <button class="page-sidebar-tab" type="button" @click="openSkills">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="12 2 2 7 12 12 22 7 12 2" />
+          <polyline points="2 17 12 22 22 17" />
+          <polyline points="2 12 12 17 22 12" />
+        </svg>
+        <span>{{ t('sidebar.skills') }}</span>
+      </button>
+      <button class="page-sidebar-tab" type="button" @click="openPlugins">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l2.1-2.1a4 4 0 0 1-5.3 5.3l-7.8 7.8a2.1 2.1 0 0 1-3-3l7.8-7.8a4 4 0 0 1 5.3-5.3l-2.1 2.1z" />
+          <path d="M5 19l1-1" />
+        </svg>
+        <span>{{ t('sidebar.plugins') }}</span>
+      </button>
+      <button class="page-sidebar-tab" type="button" @click="openMcp">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7V4h16v3" />
+          <path d="M9 20h6" />
+          <path d="M12 7v13" />
+          <rect x="4" y="7" width="16" height="7" rx="2" />
+        </svg>
+        <span>{{ t('sidebar.mcp') }}</span>
       </button>
     </div>
     <div v-if="showModeSwitch" class="conversation-switch conversation-switch--three" role="tablist" aria-label="Conversation type">
