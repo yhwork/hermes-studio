@@ -8,6 +8,7 @@ import { fetchContextLength } from '@/api/hermes/sessions'
 import { setModelContext } from '@/api/hermes/model-context'
 import { fetchSkills, type SkillCategory, type SkillInfo } from '@/api/hermes/skills'
 import { deleteSkillBundleApi, fetchSkillBundles, type SkillBundleInfo } from '@/api/hermes/skill-bundles'
+import { listWorkflows, type WorkflowRecord } from '@/api/hermes/workflows'
 import { NButton, NTooltip, NModal, NInputNumber, NPopover, NSlider, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import { computed, ref, nextTick, onMounted, onUnmounted, watch, h } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -287,6 +288,91 @@ const bridgeCommands = computed<SlashCommandOption[]>(() =>
 const slashActive = ref(false)
 const slashQuery = ref('')
 const slashActiveIndex = ref(0)
+
+// @ workflow autocomplete state
+const atActive = ref(false)
+const atQuery = ref('')
+const atActiveIndex = ref(0)
+const workflows = ref<WorkflowRecord[]>([])
+let workflowsLoaded = false
+let workflowsLoadRequest: Promise<void> | null = null
+
+const filteredWorkflows = computed(() => {
+  const query = atQuery.value.trim().toLowerCase()
+  if (!query) return workflows.value
+  return workflows.value.filter(wf =>
+    wf.name.toLowerCase().includes(query)
+  )
+})
+
+async function loadWorkflows() {
+  if (workflowsLoadRequest) return workflowsLoadRequest
+  workflowsLoadRequest = (async () => {
+    try {
+      workflows.value = await listWorkflows()
+      workflowsLoaded = true
+    } catch {
+      workflows.value = []
+    } finally {
+      workflowsLoadRequest = null
+    }
+  })()
+  return workflowsLoadRequest
+}
+
+function updateAtState() {
+  const el = textareaRef.value
+  if (!el) {
+    atActive.value = false
+    return
+  }
+  const cursorPos = el.selectionStart
+  const beforeCursor = inputText.value.slice(0, cursorPos)
+  
+  // Find the last @ before cursor
+  const atMatch = beforeCursor.match(/@([^\s@]*)$/)
+  if (!atMatch) {
+    atActive.value = false
+    return
+  }
+  
+  atQuery.value = atMatch[1]
+  atActiveIndex.value = 0
+  
+  // Load workflows on first @ trigger
+  if (!workflowsLoaded && !workflowsLoadRequest) {
+    loadWorkflows().then(() => {
+      atActive.value = filteredWorkflows.value.length > 0
+    })
+  } else {
+    atActive.value = filteredWorkflows.value.length > 0
+  }
+}
+
+function selectWorkflow(wf: WorkflowRecord) {
+  const el = textareaRef.value
+  if (!el) return
+  
+  const cursorPos = el.selectionStart
+  const beforeCursor = inputText.value.slice(0, cursorPos)
+  const afterCursor = inputText.value.slice(cursorPos)
+  
+  // Replace @query with @workflow_name
+  const atMatch = beforeCursor.match(/@([^\s@]*)$/)
+  if (!atMatch) return
+  
+  const newBefore = beforeCursor.slice(0, -atMatch[0].length)
+  inputText.value = `${newBefore}@${wf.name} ${afterCursor}`
+  atActive.value = false
+  
+  nextTick(() => {
+    const textarea = textareaRef.value
+    if (!textarea) return
+    const newPos = newBefore.length + wf.name.length + 2 // @name + space
+    textarea.setSelectionRange(newPos, newPos)
+    textarea.focus()
+  })
+}
 const skillCategories = ref<SkillCategory[]>([])
 const showSkillPicker = ref(false)
 const skillSearch = ref('')
@@ -1117,6 +1203,31 @@ function isImeEnter(e: KeyboardEvent): boolean {
 }
 
 function handleKeydown(e: KeyboardEvent) {
+  if (atActive.value && filteredWorkflows.value.length > 0) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      atActiveIndex.value = (atActiveIndex.value + 1) % filteredWorkflows.value.length
+      scrollAtCommandIntoView()
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      atActiveIndex.value = (atActiveIndex.value - 1 + filteredWorkflows.value.length) % filteredWorkflows.value.length
+      scrollAtCommandIntoView()
+      return
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault()
+      selectWorkflow(filteredWorkflows.value[atActiveIndex.value])
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      atActive.value = false
+      return
+    }
+  }
+
   if (slashActive.value && filteredBridgeCommands.value.length > 0) {
     if (e.key === 'ArrowDown') {
       e.preventDefault()
@@ -1151,10 +1262,28 @@ function handleKeydown(e: KeyboardEvent) {
 
 function handleInput(e: Event) {
   const el = e.target as HTMLTextAreaElement
-  if (!isComposing.value) updateSlashState()
+  if (!isComposing.value) {
+    updateSlashState()
+    updateAtState()
+  }
   // 用户手动拖拽自定义高度时，不覆盖
   if (textareaHeight.value !== null) return
   autoSizeTextarea(el)
+}
+
+function scrollAtCommandIntoView() {
+  nextTick(() => {
+    const container = document.querySelector('.at-workflow-dropdown')
+    if (!container) return
+    const activeItem = container.querySelector('.at-workflow-item.active')
+    if (activeItem) {
+      activeItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    }
+  })
+}
+
+function handleAtCommandHover(index: number) {
+  atActiveIndex.value = index
 }
 
 function handleCommandHover(index: number) {
@@ -1162,10 +1291,12 @@ function handleCommandHover(index: number) {
 }
 
 function onDocumentMousedown(e: MouseEvent) {
-  if (!slashActive.value) return
   const target = e.target as HTMLElement
-  if (!target.closest('.slash-command-dropdown') && !target.closest('.input-wrapper')) {
+  if (slashActive.value && !target.closest('.slash-command-dropdown') && !target.closest('.input-wrapper')) {
     slashActive.value = false
+  }
+  if (atActive.value && !target.closest('.at-workflow-dropdown') && !target.closest('.input-wrapper')) {
+    atActive.value = false
   }
 }
 
@@ -1490,6 +1621,24 @@ function isImage(type: string): boolean {
             <span class="slash-command-name">/{{ command.name }}</span>
             <span v-if="command.args" class="slash-command-args">{{ command.args }}</span>
             <span class="slash-command-desc">{{ command.description }}</span>
+          </div>
+        </div>
+      </Transition>
+      <Transition name="dropdown-fade">
+        <div
+          v-if="atActive && filteredWorkflows.length > 0"
+          class="at-workflow-dropdown"
+        >
+          <div
+            v-for="(wf, i) in filteredWorkflows"
+            :key="wf.id"
+            class="at-workflow-item"
+            :class="{ active: i === atActiveIndex }"
+            @mousedown.prevent="selectWorkflow(wf)"
+            @mouseenter="handleAtCommandHover(i)"
+          >
+            <span class="at-workflow-name">@{{ wf.name }}</span>
+            <span class="at-workflow-desc">{{ wf.nodes?.length || 0 }} 个节点</span>
           </div>
         </div>
       </Transition>
@@ -2441,6 +2590,58 @@ function isImage(type: string): boolean {
   white-space: nowrap;
   color: $text-secondary;
   font-size: 12px;
+}
+
+.at-workflow-dropdown {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  max-height: 240px;
+  overflow-y: auto;
+  background: $bg-primary;
+  border: 1px solid $border-color;
+  border-radius: $radius-sm;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+  z-index: 21;
+  padding: 4px;
+
+  .dark & {
+    background: #2a2a2a;
+  }
+}
+
+.at-workflow-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: $radius-sm;
+  cursor: pointer;
+  min-height: 40px;
+
+  &.active,
+  &:hover {
+    background: rgba(var(--accent-primary-rgb), 0.1);
+  }
+}
+
+.at-workflow-name {
+  font-family: $font-code;
+  font-size: 13px;
+  color: $accent-primary;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 70%;
+}
+
+.at-workflow-desc {
+  font-size: 12px;
+  color: $text-secondary;
+  white-space: nowrap;
 }
 
 .skill-picker-modal {
