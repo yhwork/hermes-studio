@@ -260,7 +260,7 @@ watch(() => profilesStore.activeProfileName || 'default', () => {
 @use '@/styles/variables' as *;
 
 .plugins-view {
-  height: calc(100 * var(--vh));
+  height: 100%;
   display: flex;
   flex-direction: column;
 }

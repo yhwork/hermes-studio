@@ -7,11 +7,13 @@ import { useSettingsStore } from '@/stores/hermes/settings'
 import { fetchContextLength } from '@/api/hermes/sessions'
 import { setModelContext } from '@/api/hermes/model-context'
 import { fetchSkills, type SkillCategory, type SkillInfo } from '@/api/hermes/skills'
+import { fetchMcpServers } from '@/api/hermes/mcp'
 import { deleteSkillBundleApi, fetchSkillBundles, type SkillBundleInfo } from '@/api/hermes/skill-bundles'
 import { listWorkflows, type WorkflowRecord } from '@/api/hermes/workflows'
 import { NButton, NTooltip, NModal, NInputNumber, NPopover, NSlider, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import { computed, ref, nextTick, onMounted, onUnmounted, watch, h } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRouter } from 'vue-router'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
 import { extractClipboardFiles } from '@/utils/clipboard-files'
 import VoiceDialogueControls from './VoiceDialogueControls.vue'
@@ -33,6 +35,7 @@ const chatStore = useChatStore()
 const appStore = useAppStore()
 const profilesStore = useProfilesStore()
 const settingsStore = useSettingsStore()
+const router = useRouter()
 const { t } = useI18n()
 const message = useMessage()
 const dialog = useDialog()
@@ -163,6 +166,7 @@ type SlashCommandOption = {
   opensSkillPicker?: boolean
   opensBundlePicker?: boolean
   opensBundleCreator?: boolean
+  navigatesTo?: string
 }
 
 function normalizeVoiceTranscript(text: string) {
@@ -282,6 +286,7 @@ const bridgeCommands = computed<SlashCommandOption[]>(() =>
     opensSkillPicker: command.opensSkillPicker,
     opensBundlePicker: command.opensBundlePicker,
     opensBundleCreator: command.opensBundleCreator,
+    navigatesTo: command.navigatesTo,
   }))
 )
 
@@ -289,7 +294,7 @@ const slashActive = ref(false)
 const slashQuery = ref('')
 const slashActiveIndex = ref(0)
 
-// @ workflow autocomplete state
+// @ workflow + agent autocomplete state
 const atActive = ref(false)
 const atQuery = ref('')
 const atActiveIndex = ref(0)
@@ -297,12 +302,58 @@ const workflows = ref<WorkflowRecord[]>([])
 let workflowsLoaded = false
 let workflowsLoadRequest: Promise<void> | null = null
 
-const filteredWorkflows = computed(() => {
+// @-mention 子 agent 路由表：凡是注册了 `__agent_chat` 工具的 MCP server 都可 @。
+interface RoutableAgent { name: string; toolName: string }
+const routableAgents = ref<RoutableAgent[]>([])
+let agentsLoaded = false
+let agentsLoadPromise: Promise<void> | null = null
+function ensureRoutableAgentsLoaded(): Promise<void> {
+  if (agentsLoaded) return Promise.resolve()
+  if (agentsLoadPromise) return agentsLoadPromise
+  agentsLoadPromise = (async () => {
+    try {
+      const res = await fetchMcpServers()
+      routableAgents.value = (res.servers ?? [])
+        .filter(s => s.tool_names_registered.some(t => t.endsWith('__agent_chat')))
+        .map(s => ({
+          name: s.name,
+          toolName: s.tool_names_registered.find(t => t.endsWith('__agent_chat'))!,
+        }))
+      agentsLoaded = true
+    } catch {
+      routableAgents.value = []
+    } finally {
+      agentsLoadPromise = null
+    }
+  })()
+  return agentsLoadPromise
+}
+
+// @ 下拉项：workflow + agent 合并展示
+interface AtItem {
+  type: 'workflow' | 'agent'
+  name: string
+  desc: string
+  toolName?: string
+}
+const atItems = computed<AtItem[]>(() => {
+  const wfs: AtItem[] = workflows.value.map(wf => ({
+    type: 'workflow',
+    name: wf.name,
+    desc: `${wf.nodes?.length || 0} 个节点`,
+  }))
+  const agents: AtItem[] = routableAgents.value.map(a => ({
+    type: 'agent',
+    name: a.name,
+    desc: '子 agent',
+    toolName: a.toolName,
+  }))
+  return [...wfs, ...agents]
+})
+const filteredAtItems = computed(() => {
   const query = atQuery.value.trim().toLowerCase()
-  if (!query) return workflows.value
-  return workflows.value.filter(wf =>
-    wf.name.toLowerCase().includes(query)
-  )
+  if (!query) return atItems.value
+  return atItems.value.filter(it => it.name.toLowerCase().includes(query))
 })
 
 async function loadWorkflows() {
@@ -338,14 +389,17 @@ function updateAtState() {
   
   atQuery.value = atMatch[1]
   atActiveIndex.value = 0
-  
-  // Load workflows on first @ trigger
-  if (!workflowsLoaded && !workflowsLoadRequest) {
-    loadWorkflows().then(() => {
-      atActive.value = filteredWorkflows.value.length > 0
+
+  // Load workflows + agents on first @ trigger
+  const pendingLoads: Promise<void>[] = []
+  if (!workflowsLoaded && !workflowsLoadRequest) pendingLoads.push(loadWorkflows())
+  if (!agentsLoaded && !agentsLoadPromise) pendingLoads.push(ensureRoutableAgentsLoaded())
+  if (pendingLoads.length) {
+    Promise.all(pendingLoads).then(() => {
+      atActive.value = filteredAtItems.value.length > 0
     })
   } else {
-    atActive.value = filteredWorkflows.value.length > 0
+    atActive.value = filteredAtItems.value.length > 0
   }
 }
 
@@ -369,6 +423,32 @@ function selectWorkflow(wf: WorkflowRecord) {
     const textarea = textareaRef.value
     if (!textarea) return
     const newPos = newBefore.length + wf.name.length + 2 // @name + space
+    textarea.setSelectionRange(newPos, newPos)
+    textarea.focus()
+  })
+}
+
+/** @ 下拉选中：workflow 走原 selectWorkflow；agent 直接插入 `@<name> `（发送时再改写）。 */
+function selectAtItem(item: AtItem) {
+  if (item.type === 'workflow') {
+    const wf = workflows.value.find(w => w.name === item.name)
+    if (wf) selectWorkflow(wf)
+    return
+  }
+  const el = textareaRef.value
+  if (!el) return
+  const cursorPos = el.selectionStart
+  const beforeCursor = inputText.value.slice(0, cursorPos)
+  const afterCursor = inputText.value.slice(cursorPos)
+  const atMatch = beforeCursor.match(/@([^\s@]*)$/)
+  if (!atMatch) return
+  const newBefore = beforeCursor.slice(0, -atMatch[0].length)
+  inputText.value = `${newBefore}@${item.name} ${afterCursor}`
+  atActive.value = false
+  nextTick(() => {
+    const textarea = textareaRef.value
+    if (!textarea) return
+    const newPos = newBefore.length + item.name.length + 2
     textarea.setSelectionRange(newPos, newPos)
     textarea.focus()
   })
@@ -734,6 +814,11 @@ function updateSlashState() {
 }
 
 function selectBridgeCommand(command: SlashCommandOption) {
+  if (command.navigatesTo) {
+    slashActive.value = false
+    router.push({ name: command.navigatesTo })
+    return
+  }
   if (command.opensSkillPicker) {
     slashActive.value = false
     void openSkillPicker()
@@ -1055,25 +1140,65 @@ function handleDrop(e: DragEvent) {
 
 defineExpose({ addFiles, addBrowserAttachment })
 
+// --- @-mention 子 agent 路由（发送时改写）---
+// `routableAgents` / `ensureRoutableAgentsLoaded` 定义在上方 @-state 区。
+// `resolveAgentMention` 匹配开头的 `@<agent>`，buildDelegationText 生成委派指令。
+
+function resolveAgentMention(text: string): { agent: RoutableAgent; rest: string } | null {
+  const m = text.match(/^@([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/)
+  if (!m) return null
+  const wanted = m[1].replace(/_/g, '-').toLowerCase()
+  const agent = routableAgents.value.find(a => a.name.toLowerCase() === wanted)
+  if (!agent) return null
+  return { agent, rest: (m[2] ?? '').trim() }
+}
+
+function buildDelegationText(agent: RoutableAgent, rest: string): string {
+  const task = rest || '请简要介绍你的能力。'
+  return `调用工具 \`${agent.toolName}\`，将下面的「任务」作为 message 参数传给子 agent「${agent.name}」独立处理。
+
+规则：
+1. 不要自己执行任务内容——交给子 agent。
+2. 子 agent 返回结果后，直接转达给用户（精简格式化即可）。
+3. 如果子 agent 返回了错误或提出了需要用户确认的问题：
+   - 先结合你自身的知识和已有上下文尝试解答；
+   - 如果你无法解答，将子 agent 的问题/错误原样转达给用户，让用户补充信息后再继续。
+
+任务：
+${task}`
+}
+
 // --- Send ---
 
-function handleSend() {
-  const text = inputText.value.trim()
-  if (!text && attachments.value.length === 0) return
-  if (isBridgeSession.value && text === '/skill' && attachments.value.length === 0) {
+async function handleSend() {
+  const raw = inputText.value.trim()
+  if (!raw && attachments.value.length === 0) return
+  if (isBridgeSession.value && raw === '/skill' && attachments.value.length === 0) {
     void openSkillPicker()
     return
   }
-  if (isBridgeSession.value && attachments.value.length === 0 && /^\/bundles$/i.test(text)) {
+  if (isBridgeSession.value && attachments.value.length === 0 && /^\/bundles$/i.test(raw)) {
     void openBundlePicker()
     return
   }
-  if (isBridgeSession.value && attachments.value.length === 0 && /^\/bundles\s+create$/i.test(text)) {
+  if (isBridgeSession.value && attachments.value.length === 0 && /^\/bundles\s+create$/i.test(raw)) {
     openBundleCreator()
     return
   }
 
-  chatStore.sendMessage(text, attachments.value.length > 0 ? attachments.value : undefined)
+  // @-mention 子 agent 路由：`@agent-demo <任务>` → 委派指令
+  let text = raw
+  let displayText: string | undefined
+  if (raw.startsWith('@')) {
+    await ensureRoutableAgentsLoaded()
+    const mention = resolveAgentMention(raw)
+    if (mention) {
+      text = buildDelegationText(mention.agent, mention.rest)
+      displayText = raw // 对话气泡显示用户原文，不暴露系统委派指令
+    }
+  }
+
+  chatStore.sendMessage(text, attachments.value.length > 0 ? attachments.value : undefined, displayText)
   inputText.value = ''
   saveDraftForActiveSession('')
   attachments.value = []
@@ -1203,22 +1328,22 @@ function isImeEnter(e: KeyboardEvent): boolean {
 }
 
 function handleKeydown(e: KeyboardEvent) {
-  if (atActive.value && filteredWorkflows.value.length > 0) {
+  if (atActive.value && filteredAtItems.value.length > 0) {
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      atActiveIndex.value = (atActiveIndex.value + 1) % filteredWorkflows.value.length
+      atActiveIndex.value = (atActiveIndex.value + 1) % filteredAtItems.value.length
       scrollAtCommandIntoView()
       return
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault()
-      atActiveIndex.value = (atActiveIndex.value - 1 + filteredWorkflows.value.length) % filteredWorkflows.value.length
+      atActiveIndex.value = (atActiveIndex.value - 1 + filteredAtItems.value.length) % filteredAtItems.value.length
       scrollAtCommandIntoView()
       return
     }
     if (e.key === 'Enter' || e.key === 'Tab') {
       e.preventDefault()
-      selectWorkflow(filteredWorkflows.value[atActiveIndex.value])
+      selectAtItem(filteredAtItems.value[atActiveIndex.value])
       return
     }
     if (e.key === 'Escape') {
@@ -1626,19 +1751,19 @@ function isImage(type: string): boolean {
       </Transition>
       <Transition name="dropdown-fade">
         <div
-          v-if="atActive && filteredWorkflows.length > 0"
+          v-if="atActive && filteredAtItems.length > 0"
           class="at-workflow-dropdown"
         >
           <div
-            v-for="(wf, i) in filteredWorkflows"
-            :key="wf.id"
+            v-for="(item, i) in filteredAtItems"
+            :key="`${item.type}:${item.name}`"
             class="at-workflow-item"
-            :class="{ active: i === atActiveIndex }"
-            @mousedown.prevent="selectWorkflow(wf)"
+            :class="{ active: i === atActiveIndex, agent: item.type === 'agent' }"
+            @mousedown.prevent="selectAtItem(item)"
             @mouseenter="handleAtCommandHover(i)"
           >
-            <span class="at-workflow-name">@{{ wf.name }}</span>
-            <span class="at-workflow-desc">{{ wf.nodes?.length || 0 }} 个节点</span>
+            <span class="at-workflow-name">@{{ item.name }}</span>
+            <span class="at-workflow-desc">{{ item.desc }}</span>
           </div>
         </div>
       </Transition>
@@ -2624,6 +2749,14 @@ function isImage(type: string): boolean {
   &.active,
   &:hover {
     background: rgba(var(--accent-primary-rgb), 0.1);
+  }
+
+  // 子 agent 项用紫色描边区分
+  &.agent .at-workflow-name {
+    color: #7c3aed;
+  }
+  &.agent .at-workflow-desc::before {
+    content: '🤖 ';
   }
 }
 

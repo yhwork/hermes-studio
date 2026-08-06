@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NButton, NSwitch, NPopconfirm } from 'naive-ui'
+import { NButton, NSwitch, NPopconfirm, NSpin } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import type { McpServerInfo } from '@/api/hermes/mcp'
 
 const props = defineProps<{
   server: McpServerInfo
   toolsByServer: Record<string, Array<{ name: string; description?: string }>>
+  loadingState?: { test?: boolean; reload?: boolean; remove?: boolean; toggle?: boolean; connecting?: boolean }
 }>()
 
 const emit = defineEmits<{
@@ -20,13 +21,19 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
+const isConnecting = computed(() =>
+  props.loadingState?.connecting || props.loadingState?.reload
+)
+
 function statusClass(server: McpServerInfo) {
   if (server.raw_config.enabled === false) return 'disabled'
+  if (isConnecting.value) return 'connecting'
   return server.connected ? 'connected' : 'disconnected'
 }
 
 function statusLabel(server: McpServerInfo) {
   if (server.raw_config.enabled === false) return t('mcp.disabledStatus')
+  if (isConnecting.value) return t('mcp.connectingStatus')
   return server.connected ? t('mcp.connectedStatus') : t('mcp.disconnectedStatus')
 }
 
@@ -35,10 +42,13 @@ const MAX_VISIBLE_TOOLS = 20
 </script>
 
 <template>
-  <div class="mcp-card" :class="{ disconnected: !server.connected, disabled: server.raw_config.enabled === false }">
+  <div class="mcp-card" :class="{ disconnected: !server.connected && !isConnecting, disabled: server.raw_config.enabled === false, connecting: isConnecting }">
     <!-- 第一行：标题 + 标签 -->
     <div class="card-header">
-      <h3 class="server-name">{{ server.name }}</h3>
+      <h3 class="server-name">
+        {{ server.name }}
+        <NSpin v-if="isConnecting" size="small" class="connecting-spin" />
+      </h3>
       <div class="server-badges">
         <span class="type-badge transport">{{ server.transport }}</span>
         <span class="type-badge" :class="statusClass(server)">{{ statusLabel(server) }}</span>
@@ -72,6 +82,9 @@ const MAX_VISIBLE_TOOLS = 20
           +{{ tools.length - MAX_VISIBLE_TOOLS }} {{ t('mcp.more') }}
         </span>
       </div>
+      <div v-else-if="!server.connected && !isConnecting" class="tools-empty disconnected-hint">
+        <span class="muted">{{ t('mcp.disconnectedHint') }}</span>
+      </div>
       <div v-else class="tools-empty">
         <span class="muted">{{ t('mcp.zeroTools') }}</span>
       </div>
@@ -81,12 +94,12 @@ const MAX_VISIBLE_TOOLS = 20
     <div class="card-footer">
       <div class="card-actions">
         <NButton size="tiny" quaternary @click="emit('edit', server)">{{ t('mcp.edit') }}</NButton>
-        <NButton size="tiny" quaternary :disabled="!server.connected" @click="emit('manageTools', server)">{{ t('mcp.manageTools') }}</NButton>
-        <NButton size="tiny" quaternary @click="emit('test', server)">{{ t('mcp.test') }}</NButton>
-        <NButton size="tiny" quaternary @click="emit('reload', server.name)">{{ t('mcp.reload') }}</NButton>
+        <NButton size="tiny" quaternary :disabled="!server.connected || loadingState?.reload" @click="emit('manageTools', server)">{{ t('mcp.manageTools') }}</NButton>
+        <NButton size="tiny" quaternary :loading="loadingState?.test" :disabled="!server.connected || loadingState?.test" @click="emit('test', server)">{{ t('mcp.test') }}</NButton>
+        <NButton size="tiny" quaternary :loading="loadingState?.reload" :disabled="loadingState?.reload" @click="emit('reload', server.name)">{{ t('mcp.reload') }}</NButton>
         <NPopconfirm @positive-click="emit('remove', server)">
           <template #trigger>
-            <NButton size="tiny" quaternary type="error">{{ t('mcp.remove') }}</NButton>
+            <NButton size="tiny" quaternary type="error" :loading="loadingState?.remove" :disabled="loadingState?.remove">{{ t('mcp.remove') }}</NButton>
           </template>
           {{ t('mcp.confirmRemove', { name: server.name }) }}
         </NPopconfirm>
@@ -94,6 +107,8 @@ const MAX_VISIBLE_TOOLS = 20
       <NSwitch
         :value="server.raw_config.enabled !== false"
         size="small"
+        :loading="loadingState?.toggle"
+        :disabled="loadingState?.toggle"
         @update:value="() => emit('toggleEnabled', server)"
       />
     </div>
@@ -108,18 +123,36 @@ const MAX_VISIBLE_TOOLS = 20
   border: 1px solid $border-color;
   border-radius: $radius-md;
   padding: 16px;
-  transition: border-color $transition-fast;
+  transition: all 0.25s ease;
+  cursor: pointer;
 
   &:hover {
-    border-color: rgba(var(--accent-primary-rgb), 0.3);
+    border-color: rgba(var(--accent-primary-rgb), 0.5);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    transform: translateY(-2px);
+  }
+
+  &:active {
+    transform: translateY(0);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
   }
 
   &.disconnected {
     border-color: rgba(var(--error-rgb), 0.3);
+
+    &:hover {
+      border-color: rgba(var(--error-rgb), 0.5);
+    }
   }
 
   &.disabled {
     opacity: 0.7;
+    cursor: not-allowed;
+
+    &:hover {
+      transform: none;
+      box-shadow: none;
+    }
   }
 }
 
@@ -175,6 +208,16 @@ const MAX_VISIBLE_TOOLS = 20
     background: rgba(var(--text-muted-rgb, 128,128,128), 0.12);
     color: $text-muted;
   }
+
+  &.connecting {
+    border-color: rgba(var(--warning-rgb), 0.4);
+    background: rgba(var(--warning-rgb), 0.02);
+  }
+}
+
+.connecting-spin {
+  margin-left: 6px;
+  font-size: 12px;
 }
 
 .card-body {
@@ -185,16 +228,22 @@ const MAX_VISIBLE_TOOLS = 20
 }
 
 .error-row {
-  margin-bottom: 4px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: rgba(var(--error-rgb), 0.08);
+  border-left: 3px solid var(--error-color);
+  border-radius: 4px;
 }
 
 .error-text {
-  color: $error;
-  font-size: 11px;
+  color: var(--error-color);
+  font-size: 12px;
+  line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  font-weight: 500;
 }
 
 .info-row {

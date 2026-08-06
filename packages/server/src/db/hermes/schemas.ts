@@ -3,6 +3,8 @@
  * All table schemas are defined here for unified management and migration.
  */
 
+import { initKnowledgeBaseTables } from './knowledge-base-store'
+
 // ============================================================================
 // Usage Store (usage-store.ts)
 // ============================================================================
@@ -1158,6 +1160,9 @@ export function initAllHermesTables(): void {
         idx_gc_room_members_user: 'CREATE INDEX idx_gc_room_members_user ON gc_room_members(userId)',
       }
     })
+
+    // Knowledge base
+    initKnowledgeBaseTables()
   } catch (e) {
     console.error('Error initializing Hermes SQLite tables:', e)
     console.error(`[Schema] Database initialization failed. Existing database was left untouched: ${getStoragePath()}`)

@@ -317,8 +317,23 @@ async function loadOlderHistoryMessages(sessionId: string): Promise<boolean> {
 }
 
 async function handleSessionClick(sessionId: string, profile?: string | null) {
+  // 导入会话到 Web UI（如果已存在则跳过），然后跳转到聊天页继续对话
+  const summary = findHistorySession(sessionId)
+  try {
+    const result = await importHermesSession(sessionId, summary?.profile || profile || null)
+    if (!result.ok) {
+      message.error(t('chat.importSessionFailed'))
+      return
+    }
+  } catch (err) {
+    console.error('Failed to import session:', err)
+    message.error(t('chat.importSessionFailed'))
+    return
+  }
+
+  // 跳转到聊天页面并切换到该会话
   await router.push({
-    name: 'hermes.historySession',
+    name: 'hermes.session',
     params: { sessionId },
     query: profile ? { profile } : undefined,
   })

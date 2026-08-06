@@ -68,6 +68,12 @@ const FilesPanel = defineAsyncComponent(async () => (await import('./FilesPanel.
 const FilePreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/FilePreview.vue')).default);
 const WorkspaceDiffPreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/WorkspaceDiffPreview.vue')).default);
 const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('./DesktopBrowserPanel.vue')).default);
+const SkillsView = defineAsyncComponent(async () => (await import('@/views/hermes/SkillsView.vue')).default);
+const PluginsView = defineAsyncComponent(async () => (await import('@/views/hermes/PluginsView.vue')).default);
+const McpManagerView = defineAsyncComponent(async () => (await import('@/views/hermes/McpManagerView.vue')).default);
+const DelegationPanel = defineAsyncComponent(async () => (await import('./DelegationPanel.vue')).default);
+const KnowledgeBasePanel = defineAsyncComponent(async () => (await import('./KnowledgeBasePanel.vue')).default);
+const JobsView = defineAsyncComponent(async () => (await import('@/views/hermes/JobsView.vue')).default);
 
 const chatStore = useChatStore();
 const appStore = useAppStore();
@@ -112,6 +118,49 @@ const toolPanelWidth = ref(loadToolPanelWidth());
 const toolResizeStart = ref<{ x: number; width: number } | null>(null);
 
 const currentMode = ref<"chat" | "live">("chat");
+
+// Inline management panel (skills / plugins / mcp / delegation) shown over the
+// chat area so the left session sidebar stays put while only the right content
+// swaps. The delegation panel lists sub-agent delegations for the active session.
+type InlineManageView = "skills" | "plugins" | "mcp" | "delegation" | "knowledgeBase" | "jobs";
+const inlineView = ref<InlineManageView | null>(null);
+const inlineViewComponent = computed(() => {
+  switch (inlineView.value) {
+    case "skills": return SkillsView;
+    case "plugins": return PluginsView;
+    case "mcp": return McpManagerView;
+    case "delegation": return DelegationPanel;
+    case "knowledgeBase": return KnowledgeBasePanel;
+    case "jobs": return JobsView;
+    default: return null;
+  }
+});
+const inlineViewTitle = computed(() => {
+  switch (inlineView.value) {
+    case "skills": return t("sidebar.skills");
+    case "plugins": return t("sidebar.plugins");
+    case "mcp": return t("sidebar.mcp");
+    case "delegation": return t("delegation.title");
+    case "knowledgeBase": return t("knowledgeBase.title");
+    case "jobs": return t("sidebar.jobs");
+    default: return "";
+  }
+});
+function closeInlineView() {
+  inlineView.value = null;
+}
+function handleNavigateManage(event: Event) {
+  const detail = (event as CustomEvent<{ panel: string }>).detail;
+  if (!detail) return;
+  if (detail.panel === "skills" || detail.panel === "plugins" || detail.panel === "mcp" || detail.panel === "delegation" || detail.panel === "knowledgeBase" || detail.panel === "jobs") {
+    event.preventDefault();
+    inlineView.value = detail.panel as InlineManageView;
+  }
+}
+function handleToggleSessionSidebar(event: Event) {
+  event.preventDefault();
+  showSessions.value = !showSessions.value;
+}
 
 // Batch selection mode
 const isBatchMode = ref(false);
@@ -365,6 +414,8 @@ function handleOpenSubagentStreamRequest(event: Event) {
   const customEvent = event as CustomEvent<OpenSubagentStreamDetail>;
   const detail = customEvent.detail;
   if (!detail?.sessionId || !detail.subagentId || detail.sessionId !== chatStore.activeSessionId) return;
+  // Close any inline management panel so the sub-agent stream overlay is visible.
+  inlineView.value = null;
   if (toolPanelStore.workspaceDiff && filesStore.hasUnsavedChanges) {
     message.warning(t("files.unsavedChanges"));
     return;
@@ -398,6 +449,8 @@ onMounted(() => {
   window.addEventListener("hermes:preview-workspace-file", handleWorkspaceFilePreviewRequest);
   window.addEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest);
   window.addEventListener(OPEN_SUBAGENT_STREAM_EVENT, handleOpenSubagentStreamRequest);
+  window.addEventListener("hermes:navigate-manage", handleNavigateManage);
+  window.addEventListener("hermes:toggle-session-sidebar", handleToggleSessionSidebar);
   window.addEventListener("resize", handleToolPanelViewportResize);
   handleToolPanelViewportResize();
   if (profilesStore.profiles.length === 0) {
@@ -440,6 +493,8 @@ onUnmounted(() => {
   window.removeEventListener("hermes:preview-workspace-file", handleWorkspaceFilePreviewRequest);
   window.removeEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest);
   window.removeEventListener(OPEN_SUBAGENT_STREAM_EVENT, handleOpenSubagentStreamRequest);
+  window.removeEventListener("hermes:navigate-manage", handleNavigateManage);
+  window.removeEventListener("hermes:toggle-session-sidebar", handleToggleSessionSidebar);
   window.removeEventListener("resize", handleToolPanelViewportResize);
   stopToolResize();
   sessionFadeAnimation?.cancel();
@@ -1002,35 +1057,52 @@ watch(
 );
 
 async function openNewChatModal() {
-  isBatchMode.value = false;
-  selectedSessionKeys.value.clear();
-  showBatchDeleteConfirm.value = false;
-  showNewChatModal.value = true;
+  // 直接创建新会话，不显示弹框
+  await quickCreateNewChat();
+}
+
+async function quickCreateNewChat() {
+  // 如果当前已是空白新对话，不再重复创建
+  const active = chatStore.activeSession;
+  if (active && (active.messages?.length ?? 0) === 0 && (active.messageCount ?? 0) === 0) {
+    return;
+  }
   newChatLoading.value = true;
-  newChatCategoryId.value = null;
   try {
-    await loadSessionCategories();
+    // 加载必要数据
     if (profilesStore.profiles.length === 0) await profilesStore.fetchProfiles();
     if (appStore.modelGroups.length === 0 && appStore.profileModelGroups.length === 0) {
       await appStore.loadModels();
     }
-    newChatProfile.value =
-      profilesStore.activeProfileName ||
-      profilesStore.profiles.find((profile) => profile.active)?.name ||
-      profilesStore.profiles[0]?.name ||
+
+    const profile = profilesStore.activeProfileName || 
+      profilesStore.profiles.find((p) => p.active)?.name || 
+      profilesStore.profiles[0]?.name || 
       "default";
-    
-    // Initialize workspace composable and load defaults
-    initWorkspaceComposable(newChatProfile.value);
-    
-    // Auto-fill most recent default workspace if available
-    if (mostRecentDefaultWorkspace.value) {
-      newChatWorkspace.value = mostRecentDefaultWorkspace.value;
-    } else {
-      newChatWorkspace.value = "";
+
+    // 初始化工作区
+    initWorkspaceComposable(profile);
+    const workspace = mostRecentDefaultWorkspace.value || "";
+
+    // 使用 newChat 创建会话（内部会调用 switchSession 激活会话）
+    const session = chatStore.newChat({
+      profile,
+      workspace: workspace || null,
+      source: "cli",
+      agent: "hermes",
+    });
+
+    // 记录工作区使用
+    if (workspace && workspaceComposable) {
+      workspaceComposable.recordWorkspaceUsage(workspace);
+      recentWorkspaces.value = workspaceComposable.loadRecentWorkspaces();
     }
-    
-    syncNewChatModelSelection();
+
+    // 跳转到新会话
+    await router.push({
+      name: chatStore.runtimeMode === "global_agent" ? "hermes.globalAgentSession" : "hermes.session",
+      params: { sessionId: session.id },
+    });
   } finally {
     newChatLoading.value = false;
   }
@@ -1554,6 +1626,50 @@ async function handleWorkspaceConfirm() {
   showWorkspaceModal.value = false;
 }
 
+// ── Workspace dropdown select ─────────────────────────────────────
+const workspaceSelectOptions = computed(() => {
+  const seen = new Set<string>();
+  const options: { label: string; value: string }[] = [];
+
+  // Current session workspace first
+  const current = chatStore.activeSession?.workspace;
+  if (current && !seen.has(current)) {
+    seen.add(current);
+    options.push({ label: getFolderName(current), value: current });
+  }
+
+  // Pinned (default) workspaces
+  for (const ws of defaultWorkspaces.value || []) {
+    if (ws && !seen.has(ws)) {
+      seen.add(ws);
+      options.push({ label: getFolderName(ws), value: ws });
+    }
+  }
+
+  // Recent workspaces
+  for (const ws of recentWorkspaces.value || []) {
+    if (ws?.path && !seen.has(ws.path)) {
+      seen.add(ws.path);
+      options.push({ label: getFolderName(ws.path), value: ws.path });
+    }
+  }
+
+  return options;
+});
+
+async function handleWorkspaceSelectChange(value: string | null) {
+  if (!chatStore.activeSession) return;
+  const path = value || null;
+  const ok = await setSessionWorkspace(chatStore.activeSession.id, path);
+  if (ok) {
+    chatStore.activeSession.workspace = path;
+    if (path && workspaceComposable) {
+      workspaceComposable.recordWorkspaceUsage(path);
+      recentWorkspaces.value = workspaceComposable.loadRecentWorkspaces();
+    }
+  }
+}
+
 const showSessionModelModal = ref(false);
 const showSessionModelModeModal = ref(false);
 const sessionModelSessionId = ref<string | null>(null);
@@ -1813,6 +1929,8 @@ async function handleSessionModelCustomSubmit() {
         <PageSidebarNav
           :active="chatStore.runtimeMode === 'global_agent' ? 'global' : 'chat'"
           :primary-label="t('chat.newChat')"
+          show-delegation
+          show-knowledge-base
           @primary="openNewChatModal"
         />
         <div class="session-list-toolbar">
@@ -2307,14 +2425,7 @@ async function handleSessionModelCustomSubmit() {
     >
       <NDrawerContent :title="t('chat.newChat')" closable>
         <div class="new-chat-form">
-          <label class="new-chat-field">
-            <span class="new-chat-label">{{ t("chat.agent") }}</span>
-            <NSelect
-              v-model:value="newChatAgent"
-              :options="newChatAgentOptions"
-              :disabled="newChatLoading"
-            />
-          </label>
+          <!-- Agent selector hidden: default to Hermes, Hermes dispatches to other agents -->
           <label v-if="isNewChatExternalCodingAgent" class="new-chat-field">
             <span class="new-chat-label">{{ t("codingAgents.launchModeScope") }}</span>
             <NRadioGroup v-model:value="newChatAgentMode" name="new-chat-coding-agent-mode">
@@ -2651,6 +2762,25 @@ async function handleSessionModelCustomSubmit() {
               ref="messageListRef"
               :approval-portal-to-body="showRealtimeVoice"
             />
+            <div class="workspace-bar" v-if="chatStore.activeSession">
+              <div class="workspace-bar-row">
+                <span class="workspace-bar-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/>
+                  </svg>
+                </span>
+                <NSelect
+                  :value="chatStore.activeSession.workspace || ''"
+                  :options="workspaceSelectOptions"
+                  placeholder="选择工作区"
+                  filterable
+                  clearable
+                  size="small"
+                  class="workspace-select"
+                  @update:value="handleWorkspaceSelectChange"
+                />
+              </div>
+            </div>
             <ChatInput
               ref="chatInputRef"
               :model-label="activeSessionModelLabel"
@@ -2745,6 +2875,34 @@ async function handleSessionModelCustomSubmit() {
         v-else
         :human-only="sessionBrowserPrefsStore.humanOnly"
       />
+      <div v-if="inlineView" class="chat-inline-panel">
+        <header class="chat-inline-panel-header">
+          <button
+            class="chat-inline-back"
+            type="button"
+            :title="t('realtimeVoice.back')"
+            @click="closeInlineView"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+            <span>{{ t("realtimeVoice.back") }}</span>
+          </button>
+          <span class="chat-inline-panel-title">{{ inlineViewTitle }}</span>
+        </header>
+        <div class="chat-inline-panel-body">
+          <component :is="inlineViewComponent" />
+        </div>
+      </div>
     </div>
     <Teleport to="body">
       <RealtimeVoiceStage
@@ -3355,6 +3513,7 @@ async function handleSessionModelCustomSubmit() {
   border: 1px solid $border-color;
   border-radius: 14px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+  position: relative;
 
   &--sidebar-collapsed {
     margin-left: 10px;
@@ -3366,6 +3525,65 @@ async function handleSessionModelCustomSubmit() {
     border-radius: 0;
     box-shadow: none;
   }
+}
+
+.chat-inline-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: $bg-main-surface;
+  border-radius: inherit;
+  overflow: hidden;
+}
+
+.chat-inline-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  flex-shrink: 0;
+  padding: 0 12px;
+  border-bottom: 1px solid $border-color;
+  background: $bg-card;
+}
+
+.chat-inline-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: $radius-sm;
+  background: transparent;
+  color: $text-secondary;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    background-color $transition-fast,
+    color $transition-fast;
+
+  &:hover {
+    background: rgba(var(--accent-primary-rgb), 0.06);
+    color: $text-primary;
+  }
+}
+
+.chat-inline-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: $text-primary;
+}
+
+.chat-inline-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .chat-content-wrapper {
@@ -3806,6 +4024,75 @@ async function handleSessionModelCustomSubmit() {
 
   &:hover {
     color: #f5a623;
+  }
+}
+
+// ── Workspace dropdown bar ────────────────────────────────────────
+.workspace-bar {
+  padding: 6px 12px;
+  background: linear-gradient(180deg, rgba($bg-main-surface, 0.95) 0%, rgba($bg-main-surface, 0.98) 100%);
+  border-bottom: 1px solid $border-color;
+  backdrop-filter: blur(8px);
+}
+
+.workspace-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workspace-bar-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: rgba(var(--accent-primary-rgb), 0.08);
+  color: $accent-primary;
+  flex-shrink: 0;
+  transition: all $transition-fast;
+
+  &:hover {
+    background: rgba(var(--accent-primary-rgb), 0.12);
+  }
+}
+
+.workspace-select {
+  flex: 1;
+  min-width: 0;
+
+  :deep(.n-base-selection) {
+    border-radius: 6px;
+    border: 1px solid $border-color;
+    background: $bg-main-surface;
+    transition: all $transition-fast;
+
+    &:hover {
+      border-color: rgba(var(--accent-primary-rgb), 0.4);
+      box-shadow: 0 0 0 2px rgba(var(--accent-primary-rgb), 0.08);
+    }
+
+    &.n-base-selection--focus {
+      border-color: $accent-primary;
+      box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.12);
+    }
+  }
+
+  :deep(.n-base-selection-label) {
+    font-size: 13px;
+    padding: 4px 10px;
+    min-height: 28px;
+  }
+
+  :deep(.n-base-selection-placeholder) {
+    color: $text-muted;
+    font-size: 13px;
+  }
+
+  :deep(.n-base-selection-tags) {
+    padding: 2px 8px;
+    min-height: 28px;
   }
 }
 </style>

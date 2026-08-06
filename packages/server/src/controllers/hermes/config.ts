@@ -157,7 +157,7 @@ const AUXILIARY_TASKS = [
   { key: 'compression', label: 'Compression', default_timeout: 120 },
   { key: 'skills_hub', label: 'Skills hub', default_timeout: 30 },
   { key: 'approval', label: 'Approval', default_timeout: 30 },
-  { key: 'mcp', label: 'MCP', default_timeout: 30 },
+  { key: 'mcp', label: 'MCP', default_timeout: 180 },
   { key: 'title_generation', label: 'Title generation', default_timeout: 30 },
   { key: 'triage_specifier', label: 'Triage specifier', default_timeout: 120 },
   { key: 'kanban_decomposer', label: 'Kanban decomposer', default_timeout: 180 },

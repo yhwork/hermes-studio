@@ -38,6 +38,18 @@ const selectedTools = ref<string[]>([])
 const allTools = ref<string[]>([])
 const fetchingTools = ref(false)
 
+// Per-server loading states for async operations
+const loadingServers = ref<Record<string, {
+  test?: boolean
+  reload?: boolean
+  remove?: boolean
+  toggle?: boolean
+  connecting?: boolean
+}>>({})
+
+// Global reload-all loading state
+const reloadAllLoading = ref(false)
+
 const jsonPlaceholder = '{\n  "my-server": {\n    "command": "npx",\n    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]\n  }\n}'
 const yamlPlaceholder = 'my-server:\n  command: npx\n  args:\n    - "-y"\n    - "@modelcontextprotocol/server-filesystem"\n    - "/path"'
 
@@ -45,13 +57,30 @@ const placeholder = computed(() => inputMode.value === 'json' ? jsonPlaceholder 
 
 let formatTimer: ReturnType<typeof setTimeout> | null = null
 let _pendingReload: ReturnType<typeof setTimeout> | null = null
+let _pendingReloadResolvers: Array<() => void> = []
 let _autoRetryCount = 0
 const MAX_AUTO_RETRIES = 5
 const BASE_RETRY_DELAY = 2000 // 2s base
 
 function scheduleReload(delay = 3000) {
-  if (_pendingReload) clearTimeout(_pendingReload)
-  _pendingReload = setTimeout(() => { _pendingReload = null; loadServers() }, delay)
+  if (_pendingReload) {
+    clearTimeout(_pendingReload)
+    // 解决之前的 Promise，避免挂起
+    const pendingResolvers = _pendingReloadResolvers
+    _pendingReloadResolvers = []
+    pendingResolvers.forEach(r => r())
+  }
+  return new Promise<void>((resolve) => {
+    _pendingReloadResolvers.push(resolve)
+    _pendingReload = setTimeout(() => {
+      _pendingReload = null
+      const resolvers = _pendingReloadResolvers
+      _pendingReloadResolvers = []
+      loadServers().finally(() => {
+        resolvers.forEach(r => r())
+      })
+    }, delay)
+  })
 }
 
 onUnmounted(() => {
@@ -230,22 +259,24 @@ async function loadServers() {
 }
 
 async function handleReload(server?: string) {
+  const key = server || '_all'
+  if (!server) reloadAllLoading.value = true
+  loadingServers.value[key] = { ...loadingServers.value[key], reload: true }
   try {
     const res = await mcpReload(server)
     if (res.ok) {
-      if (server) {
-        const { [server]: _, ...rest } = toolsByServer.value
-        toolsByServer.value = rest
-      } else {
-        toolsByServer.value = {}
-      }
+      // Wait for loadServers to finish before showing success and clearing loading
+      // User-initiated reload should respond quickly (500ms instead of default 3000ms)
+      await scheduleReload(500)
       message.success(server ? t('mcp.reloaded', { server }) : t('mcp.reloadedAll'))
-      scheduleReload()
     } else {
       message.error(res.error || t('mcp.reloadFailed'))
     }
   } catch (err: any) {
     message.error(err.message || t('mcp.reloadFailed'))
+  } finally {
+    if (!server) reloadAllLoading.value = false
+    loadingServers.value[key] = { ...loadingServers.value[key], reload: false }
   }
 }
 
@@ -296,11 +327,23 @@ async function saveServer() {
       }
       if (added > 0) {
         showModal.value = false
-        message.success(t('mcp.serverAdded', { name: `${added} server(s)` }))
-        // Immediately show server from config (disconnected)
+        // Trigger MCP server connection (mcp_server_add only writes config, doesn't connect)
+        await mcpReload()
+        // Reset retry counter so auto-retry kicks in for newly added servers
+        _autoRetryCount = 0
+        // Mark new servers as connecting
+        for (const [name] of entries) {
+          loadingServers.value[name] = { ...loadingServers.value[name], connecting: true }
+        }
+        // Show servers from config immediately
         await loadServers()
-        // Delayed refresh to show updated connection status after discovery
-        scheduleReload()
+        message.success(t('mcp.serverAdded', { name: `${added} server(s)` }))
+        // Wait for connection status to update
+        await scheduleReload(2000)
+        // Clear connecting states
+        for (const [name] of entries) {
+          loadingServers.value[name] = { ...loadingServers.value[name], connecting: false }
+        }
       }
     } else {
       const name = editingName.value
@@ -314,8 +357,8 @@ async function saveServer() {
         message.success(t('mcp.serverUpdated', { name: editingName.value }))
         // Immediately show updated config
         await loadServers()
-        // Delayed refresh to show reconnection status
-        scheduleReload()
+        // Delayed refresh to show reconnection status (short delay for user action)
+        scheduleReload(500)
       } else {
         message.error(res.error || t('mcp.updateFailed'))
       }
@@ -328,6 +371,7 @@ async function saveServer() {
 }
 
 async function handleRemove(server: McpServerInfo) {
+  loadingServers.value[server.name] = { ...loadingServers.value[server.name], remove: true }
   try {
     const res = await mcpServerRemove(server.name)
     if (res.ok) {
@@ -340,38 +384,52 @@ async function handleRemove(server: McpServerInfo) {
     }
   } catch (err: any) {
     message.error(err.message || t('mcp.removeFailed'))
+  } finally {
+    loadingServers.value[server.name] = { ...loadingServers.value[server.name], remove: false }
   }
 }
 
 async function handleToggleEnabled(server: McpServerInfo) {
   const newValue = !server.raw_config.enabled
+  loadingServers.value[server.name] = { ...loadingServers.value[server.name], toggle: true }
   try {
     const config = { ...server.raw_config, enabled: newValue }
     const res = await mcpServerUpdate(server.name, config)
     if (res.ok) {
-      message.success(t(newValue ? 'mcp.enabled' : 'mcp.disabled', { name: server.name }))
       const { [server.name]: _, ...rest } = toolsByServer.value
       toolsByServer.value = rest
       await mcpReload(server.name)
-      scheduleReload()
+      // Wait for reload + loadServers to complete before showing result
+      // User-initiated toggle should respond quickly (500ms instead of default 3000ms)
+      await scheduleReload(500)
+      message.success(t(newValue ? 'mcp.enabled' : 'mcp.disabled', { name: server.name }))
     } else {
       message.error(res.error || t('mcp.updateFailed'))
     }
   } catch (err: any) {
     message.error(err.message || t('mcp.updateFailed'))
+  } finally {
+    loadingServers.value[server.name] = { ...loadingServers.value[server.name], toggle: false }
   }
 }
 
 async function handleTest(server: McpServerInfo) {
+  loadingServers.value[server.name] = { ...loadingServers.value[server.name], test: true }
   try {
     const res = await mcpServerTest(server.name)
-    if (res.ok && res.tools) {
-      message.success(t('mcp.testOk', { count: res.tools.length }), { duration: 3000 })
+    if (res.ok && res.tools && res.tools.length > 0) {
+      const toolNames = res.tools.slice(0, 3).join(', ')
+      const suffix = res.tools.length > 3 ? ` ${t('mcp.andMoreTools', { count: res.tools.length })}` : ''
+      message.success(`${t('mcp.testOk')}: ${toolNames}${suffix}`, { duration: 4000 })
+    } else if (res.ok && res.tools && res.tools.length === 0) {
+      message.warning(t('mcp.testEmpty'))
     } else {
-      message.warning(res.error || t('mcp.testEmpty'))
+      message.warning(res.error || t('mcp.testFailed'))
     }
   } catch (err: any) {
     message.error(err.message || t('mcp.testFailed'))
+  } finally {
+    loadingServers.value[server.name] = { ...loadingServers.value[server.name], test: false }
   }
 }
 
@@ -476,7 +534,7 @@ async function saveToolsVisibility() {
       message.success(t('mcp.toolsVisibilitySaved'))
       showToolsModal.value = false
       await loadServers()
-      scheduleReload()
+      scheduleReload(500)
     } else {
       message.error(res.error || t('mcp.updateFailed'))
     }
@@ -534,7 +592,7 @@ async function saveToolsVisibility() {
             class="search-input"
           />
           <div class="btn-group">
-            <NButton size="small" type="primary" @click="handleReload()">
+            <NButton size="small" type="primary" :loading="reloadAllLoading" @click="handleReload()">
               {{ t('mcp.reloadAll') }}
             </NButton>
             <NButton type="primary" size="small" @click="openAddModal">
@@ -549,6 +607,7 @@ async function saveToolsVisibility() {
             :key="server.name"
             :server="server"
             :tools-by-server="toolsByServer"
+            :loading-state="loadingServers[server.name] || {}"
             @edit="openEditModal"
             @test="handleTest"
             @reload="handleReload"
@@ -653,7 +712,7 @@ async function saveToolsVisibility() {
 @use '@/styles/variables' as *;
 
 .mcp-view {
-  height: calc(100 * var(--vh));
+  height: 100%;
   display: flex;
   flex-direction: column;
 }

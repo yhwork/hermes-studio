@@ -595,6 +595,8 @@ export default {
       reloadSkills: '重載技能命令',
       bundles: '查看 Skill Bundle',
       bundlesCreate: '建立 Skill Bundle',
+      skillCreate: '前往技能管理頁面建立新技能',
+      mcp: '前往 MCP 伺服器管理頁面',
     },
     bundlePicker: {
       title: 'Skill Bundles',

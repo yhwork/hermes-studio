@@ -1,0 +1,25 @@
+{
+  "name": "agent-demo",
+  "version": "1.0.0",
+  "description": "A standalone test sub-agent built on the same Hermes engine (ekko-agent) — can think, converse, and execute commands. Exposed via HTTP, WebSocket, and JSON-RPC 2.0 for verifying task dispatch, child-agent execution, and result return.",
+  "bin": {
+    "agent-demo": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "mcp": "tsx src/mcp.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

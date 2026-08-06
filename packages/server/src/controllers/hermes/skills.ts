@@ -1,4 +1,5 @@
 import { mkdir, readdir, readFile, realpath, rm, stat, writeFile, cp } from 'fs/promises'
+import { existsSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { createHash, randomBytes } from 'crypto'
@@ -22,6 +23,20 @@ function requestProfileDir(ctx: any): string {
 
 function requestSkillsDir(ctx: any): string {
   return join(requestProfileDir(ctx), 'skills')
+}
+
+/**
+ * Resolve the write directory for new skills.
+ * Priority: config.yaml `skills.write_dir` > profile's default `skills/` dir.
+ * This allows skills to be stored alongside the project (git-managed).
+ */
+async function requestWriteSkillsDir(ctx: any): Promise<string> {
+  const config = await readConfigYamlForProfile(requestedProfile(ctx))
+  const writeDir = config?.skills?.write_dir
+  if (typeof writeDir === 'string' && writeDir.trim()) {
+    return resolve(expandConfiguredPath(writeDir.trim()))
+  }
+  return requestSkillsDir(ctx)
 }
 
 type SkillTarget = 'hermes' | 'claude' | 'codex'
@@ -1019,13 +1034,16 @@ export async function importSkill(ctx: any) {
     return
   }
 
-  const skillsDir = requestSkillsDir(ctx)
+  // Use write_dir if configured, otherwise fall back to profile skills dir
+  const skillsDir = await requestWriteSkillsDir(ctx)
   await mkdir(skillsDir, { recursive: true })
   const targetRoot = category ? join(skillsDir, category) : skillsDir
 
-  // Provenance for conflict detection (cannot shadow builtin/hub)
-  const bundledManifest = readBundledManifest(await safeReadFile(join(skillsDir, '.bundled_manifest')))
-  const hubNames = readHubInstalledNames(await safeReadFile(join(skillsDir, '.hub', 'lock.json')))
+  // Provenance for conflict detection — check both write dir and profile dir
+  const profileSkillsDir = requestSkillsDir(ctx)
+  const manifestDir = existsSync(join(skillsDir, '.bundled_manifest')) ? skillsDir : profileSkillsDir
+  const bundledManifest = readBundledManifest(await safeReadFile(join(manifestDir, '.bundled_manifest')))
+  const hubNames = readHubInstalledNames(await safeReadFile(join(manifestDir, '.hub', 'lock.json')))
 
   // Decide between "zip" and "folder" mode
   const isSingleZip = filePartsAll.length === 1 &&

@@ -5,6 +5,8 @@ export type BridgeSessionCommandName =
   | 'abort'
   | 'queue'
   | 'skill'
+  | 'skill-create'
+  | 'mcp'
   | 'bundles'
   | 'learn'
   | 'plan'
@@ -30,6 +32,7 @@ export interface BridgeSessionCommandDefinition {
   opensSkillPicker?: boolean
   opensBundlePicker?: boolean
   opensBundleCreator?: boolean
+  navigatesTo?: string
 }
 
 export const BRIDGE_SESSION_COMMAND_DEFINITIONS: BridgeSessionCommandDefinition[] = [
@@ -39,6 +42,8 @@ export const BRIDGE_SESSION_COMMAND_DEFINITIONS: BridgeSessionCommandDefinition[
   { key: 'command:abort', name: 'abort', args: '', descriptionKey: 'chat.slashCommands.abort' },
   { key: 'command:queue', name: 'queue', argsKey: 'chat.slashCommandArgs.message', descriptionKey: 'chat.slashCommands.queue' },
   { key: 'command:skill', name: 'skill', args: '', descriptionKey: 'skills.title', opensSkillPicker: true },
+  { key: 'command:skill-create', name: 'skill-create', args: '', descriptionKey: 'chat.slashCommands.skillCreate', navigatesTo: 'hermes.skills' },
+  { key: 'command:mcp', name: 'mcp', args: '', descriptionKey: 'chat.slashCommands.mcp', navigatesTo: 'hermes.mcp' },
   { key: 'command:bundles', name: 'bundles', args: '', descriptionKey: 'chat.slashCommands.bundles', opensBundlePicker: true },
   { key: 'command:bundles-create', name: 'bundles', args: 'create', insertText: 'bundles create', descriptionKey: 'chat.slashCommands.bundlesCreate', opensBundleCreator: true },
   { key: 'command:learn', name: 'learn', argsKey: 'chat.slashCommandArgs.text', descriptionKey: 'chat.slashCommands.learn' },

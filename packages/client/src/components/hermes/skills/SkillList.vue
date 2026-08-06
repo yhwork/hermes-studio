@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { NSwitch, useMessage, useDialog } from 'naive-ui'
 import type { SkillCategory, SkillSource, SkillInfo } from '@/api/hermes/skills'
 import { toggleSkill, deleteSkillApi } from '@/api/hermes/skills'
@@ -29,6 +29,13 @@ const collapsedCategories = ref<Set<string>>(new Set())
 const archiveCollapsed = ref(true)
 const togglingSkills = ref<Set<string>>(new Set())
 const deletingSkills = ref<Set<string>>(new Set())
+
+// 搜索高亮函数
+function highlightText(text: string, query: string): string {
+    if (!query.trim()) return text
+    const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+    return text.replace(regex, '<mark class="search-highlight">$1</mark>')
+}
 
 const filteredArchived = computed(() => {
     let result = props.archived
@@ -235,11 +242,11 @@ function confirmDelete(category: string, skillName: string) {
                                     <span class="skill-name">
                                         <span class="source-dot" :class="`dot-${skill.source || 'local'}`"
                                             :title="t(`skills.source.${skill.source || 'local'}`)" />
-                                        {{ skill.name }}
+                                        <span v-html="highlightText(skill.name, searchQuery)"></span>
                                         <span v-if="skill.modified" class="modified-badge"
                                             :title="t('skills.modified')">✎</span>
                                     </span>
-                                    <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
+                                    <span v-if="skill.description" class="skill-desc" v-html="highlightText(skill.description, searchQuery)"></span>
                                 </div>
                                 <NSwitch v-if="!readonly" size="small" :value="skill.enabled !== false"
                                     :loading="togglingSkills.has(skill.name)"
@@ -271,11 +278,11 @@ function confirmDelete(category: string, skillName: string) {
                             <span class="skill-name">
                                 <span class="source-dot" :class="`dot-${skill.source || 'local'}`"
                                     :title="t(`skills.source.${skill.source || 'local'}`)" />
-                                {{ skill.name }}
+                                <span v-html="highlightText(skill.name, searchQuery)"></span>
                                 <span v-if="skill.modified" class="modified-badge"
                                     :title="t('skills.modified')">✎</span>
                             </span>
-                            <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
+                            <span v-if="skill.description" class="skill-desc" v-html="highlightText(skill.description, searchQuery)"></span>
                         </div>
                         <button v-if="!readonly && (skill.source ?? 'local') === 'local'" class="skill-action-btn"
                             :title="t('skills.delete')" :disabled="deletingSkills.has(skill.name)"
@@ -315,9 +322,9 @@ function confirmDelete(category: string, skillName: string) {
                         <span class="skill-name">
                             <span class="source-dot" :class="`dot-${skill.source || 'local'}`"
                                 :title="t(`skills.source.${skill.source || 'local'}`)" />
-                            {{ skill.name }}
+                            <span v-html="highlightText(skill.name, searchQuery)"></span>
                         </span>
-                        <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
+                        <span v-if="skill.description" class="skill-desc" v-html="highlightText(skill.description, searchQuery)"></span>
                     </div>
                 </button>
             </div>
@@ -348,28 +355,42 @@ function confirmDelete(category: string, skillName: string) {
 .category-header {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     width: 100%;
-    padding: 6px 10px;
+    padding: 8px 12px;
+    margin: 2px 0;
     border: none;
-    background: none;
+    background: rgba(var(--accent-primary-rgb), 0.03);
     color: $text-secondary;
-    font-size: 12px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.3px;
+    letter-spacing: 0.5px;
     cursor: pointer;
-    border-radius: $radius-sm;
+    border-radius: $radius-md;
+    transition: all 0.2s ease;
+    position: relative;
 
     &:hover {
-        background: rgba(var(--accent-primary-rgb), 0.04);
+        background: rgba(var(--accent-primary-rgb), 0.08);
+        color: $text-primary;
+
+        .category-count {
+            background: rgba(var(--accent-primary-rgb), 0.15);
+        }
     }
 
     &.sub {
-        padding-left: 22px;
+        padding-left: 24px;
         font-size: 11px;
         text-transform: none;
         letter-spacing: 0;
+        font-weight: 600;
+        background: none;
+
+        &:hover {
+            background: rgba(var(--accent-primary-rgb), 0.04);
+        }
     }
 }
 
@@ -453,26 +474,64 @@ function confirmDelete(category: string, skillName: string) {
     flex-direction: row;
     align-items: center;
     width: 100%;
-    padding: 6px 10px 6px 28px;
-    border: none;
+    padding: 8px 12px 8px 28px;
+    border: 1px solid transparent;
     background: none;
     color: $text-secondary;
     font-size: 13px;
     text-align: left;
     cursor: pointer;
     border-radius: $radius-sm;
-    transition: all $transition-fast;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     gap: 8px;
+    position: relative;
 
     &:hover {
         background: rgba(var(--accent-primary-rgb), 0.06);
+        border-color: rgba(var(--accent-primary-rgb), 0.1);
         color: $text-primary;
+        transform: translateX(2px);
+
+        .skill-action-btn {
+            opacity: 1;
+        }
+    }
+
+    &:active {
+        transform: translateX(2px) scale(0.98);
     }
 
     &.active {
-        background: rgba(var(--accent-primary-rgb), 0.1);
+        background: linear-gradient(90deg, 
+            rgba(var(--accent-primary-rgb), 0.12) 0%, 
+            rgba(var(--accent-primary-rgb), 0.06) 100%);
+        border-color: rgba(var(--accent-primary-rgb), 0.2);
         color: $text-primary;
         font-weight: 500;
+        box-shadow: 
+            inset 3px 0 0 0 $accent-primary,
+            0 1px 3px rgba(var(--accent-primary-rgb), 0.1);
+
+        .skill-name {
+            color: $accent-primary;
+        }
+
+        .skill-action-btn {
+            opacity: 1;
+        }
+    }
+
+    .skill-info {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .skill-action-btn {
+        opacity: 0;
+        transition: opacity 0.15s ease;
     }
 }
 
@@ -571,5 +630,14 @@ function confirmDelete(category: string, skillName: string) {
         opacity: 0.4;
         cursor: not-allowed;
     }
+}
+
+// 搜索高亮样式
+:deep(.search-highlight) {
+    background-color: rgba(var(--accent-primary-rgb), 0.25);
+    color: $text-primary;
+    padding: 0 2px;
+    border-radius: 2px;
+    font-weight: 600;
 }
 </style>

@@ -65,11 +65,27 @@ const remoteRelay = {
   url: 'https://api.hermes-studio.ai',
 }
 
+/**
+ * Resolve the Hermes Web UI project root directory.
+ * Used for resolving relative paths in config.yaml (e.g. skills.write_dir).
+ * Priority: HERMES_WEB_UI_DIR env > cwd.
+ */
+export function getWebUiDir(env: Record<string, string | undefined> = process.env): string {
+  const dir = env.HERMES_WEB_UI_DIR?.trim()
+  return dir ? resolve(dir) : process.cwd()
+}
+
+// Ensure HERMES_WEB_UI_DIR is always set in process.env for expandConfiguredPath usage
+if (!process.env.HERMES_WEB_UI_DIR) {
+  process.env.HERMES_WEB_UI_DIR = getWebUiDir()
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '8648', 10),
   // Default to IPv4 for stable WSL/Windows browser access. Use BIND_HOST=:: explicitly for IPv6.
   host: getListenHost(),
   appHome,
+  webUiDir: getWebUiDir(),
   uploadDir: process.env.UPLOAD_DIR || join(appHome, 'upload'),
   dataDir: resolve(__dirname, '..', 'data'),
   corsOrigins: getCorsOrigins(),

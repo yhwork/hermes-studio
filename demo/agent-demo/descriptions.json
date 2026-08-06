@@ -1,0 +1,3 @@
+{
+  "agent_chat": "Delegate a subtask to an autonomous sub-agent that plans, uses tools, and returns a result. Use for complex multi-step tasks."
+}

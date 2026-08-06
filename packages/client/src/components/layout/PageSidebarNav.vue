@@ -11,6 +11,8 @@ const props = defineProps<{
   active: ActiveSection
   primaryLabel?: string
   hideModeSwitch?: boolean
+  showDelegation?: boolean
+  showKnowledgeBase?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -33,6 +35,11 @@ function openChat() {
 }
 
 function openHistory() {
+  // In chat view, "历史" toggles the session sidebar instead of navigating.
+  // This avoids a full-page route switch that would collapse the left sidebar.
+  const event = new CustomEvent('hermes:toggle-session-sidebar', { cancelable: true })
+  if (!window.dispatchEvent(event)) return // ChatPanel handled it
+  // Fallback for non-chat hosts: navigate to the history route
   if (props.active === 'history') {
     void router.push({ name: 'hermes.chat' })
     return
@@ -50,20 +57,49 @@ function openWorkflow() {
   void router.push({ name: 'hermes.workflow' })
 }
 
+// Emit a cancelable window event so a host (e.g. ChatPanel) can open the
+// management view inline without leaving the current page. If no listener
+// calls preventDefault(), fall back to a normal route navigation so other
+// hosts keep working. `delegation` has no route — it is inline-only.
+type ManagePanel = 'skills' | 'plugins' | 'mcp' | 'delegation' | 'knowledgeBase' | 'jobs'
+
+function emitNavigateManage(panel: ManagePanel): boolean {
+  const event = new CustomEvent('hermes:navigate-manage', {
+    detail: { panel },
+    cancelable: true,
+  })
+  // dispatchEvent returns false when a listener called preventDefault().
+  return !window.dispatchEvent(event)
+}
+
+function dispatchNavigateManage(panel: ManagePanel) {
+  if (emitNavigateManage(panel)) return
+  if (panel === 'delegation' || panel === 'knowledgeBase' || panel === 'jobs' || panel === 'history') return
+  void router.push({ name: `hermes.${panel}` })
+}
+
 function openJobs() {
-  void router.push({ name: 'hermes.jobs' })
+  dispatchNavigateManage('jobs')
 }
 
 function openSkills() {
-  void router.push({ name: 'hermes.skills' })
+  dispatchNavigateManage('skills')
 }
 
 function openPlugins() {
-  void router.push({ name: 'hermes.plugins' })
+  dispatchNavigateManage('plugins')
 }
 
 function openMcp() {
-  void router.push({ name: 'hermes.mcp' })
+  dispatchNavigateManage('mcp')
+}
+
+function openDelegation() {
+  dispatchNavigateManage('delegation')
+}
+
+function openKnowledgeBase() {
+  dispatchNavigateManage('knowledgeBase')
 }
 </script>
 
@@ -168,6 +204,26 @@ function openMcp() {
           <rect x="4" y="7" width="16" height="7" rx="2" />
         </svg>
         <span>{{ t('sidebar.mcp') }}</span>
+      </button>
+      <button v-if="showDelegation" class="page-sidebar-tab" type="button" @click="openDelegation">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="5" r="2" />
+          <circle cx="5" cy="19" r="2" />
+          <circle cx="19" cy="19" r="2" />
+          <path d="M12 7v4" />
+          <path d="M12 11l-5 6" />
+          <path d="M12 11l5 6" />
+        </svg>
+        <span>{{ t('sidebar.delegation') }}</span>
+      </button>
+      <button v-if="showKnowledgeBase" class="page-sidebar-tab" type="button" @click="openKnowledgeBase">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+          <line x1="8" y1="7" x2="16" y2="7" />
+          <line x1="8" y1="11" x2="14" y2="11" />
+        </svg>
+        <span>{{ t('sidebar.knowledgeBase') }}</span>
       </button>
     </div>
     <div v-if="showModeSwitch" class="conversation-switch conversation-switch--three" role="tablist" aria-label="Conversation type">

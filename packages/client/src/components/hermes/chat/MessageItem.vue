@@ -614,6 +614,40 @@ const hasToolDetails = computed(
 const isSubagentTool = computed(() => subagentIdFromToolCall(props.message.toolCallId) !== null);
 const hasInlineToolDetails = computed(() => hasToolDetails.value && !isSubagentTool.value);
 
+// ── Image generation tool progress card ────────────────────────────
+const IMAGE_GEN_TOOL_NAMES = new Set(['image_gen', 'image_edit', 'generate_image']);
+const isImageGenTool = computed(() => {
+  const name = props.message.toolName || '';
+  // Match exact names or MCP-prefixed names like mcp__image_gen_demo__image_gen
+  const baseName = name.includes('__') ? name.split('__').pop() || '' : name;
+  return IMAGE_GEN_TOOL_NAMES.has(baseName);
+});
+const isImageGenRunning = computed(() => isImageGenTool.value && props.message.toolStatus === 'running');
+
+const imageGenPrompt = computed(() => {
+  if (!isImageGenTool.value) return '';
+  const args = props.message.toolArgs;
+  if (!args || typeof args !== 'object') return '';
+  return (args as Record<string, unknown>).prompt as string || '';
+});
+
+const imageGenElapsed = ref(0);
+let imageGenTimer: number | null = null;
+
+watchEffect(() => {
+  if (isImageGenRunning.value) {
+    imageGenElapsed.value = 0;
+    if (imageGenTimer !== null) window.clearInterval(imageGenTimer);
+    imageGenTimer = window.setInterval(() => { imageGenElapsed.value++; }, 1000);
+  } else {
+    if (imageGenTimer !== null) { window.clearInterval(imageGenTimer); imageGenTimer = null; }
+  }
+});
+
+onBeforeUnmount(() => {
+  if (imageGenTimer !== null) window.clearInterval(imageGenTimer);
+});
+
 const fullToolArgs = computed(() => toolArgsPayload.value.full);
 const formattedToolArgs = computed(() => toolArgsPayload.value.display);
 const fullToolResult = computed(() => toolResultPayload.value.full);
@@ -919,12 +953,31 @@ onBeforeUnmount(() => {
           >{{ message.toolPreview }}</span
         >
         <span
-          v-if="message.toolStatus === 'running'"
+          v-if="message.toolStatus === 'running' && !isImageGenRunning"
           class="tool-spinner"
         ></span>
         <span v-if="message.toolStatus === 'error'" class="tool-error-badge">{{
           t("chat.error")
         }}</span>
+      </div>
+      <!-- Image generation progress card -->
+      <div v-if="isImageGenRunning" class="image-gen-progress">
+        <div class="image-gen-canvas">
+          <div class="image-gen-shimmer"></div>
+          <svg class="image-gen-icon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+            <circle cx="8.5" cy="8.5" r="1.5" />
+            <polyline points="21 15 16 10 5 21" />
+          </svg>
+        </div>
+        <div class="image-gen-info">
+          <div class="image-gen-status">
+            <span class="image-gen-dot"></span>
+            {{ t('chat.imageGenInProgress') }}
+          </div>
+          <div v-if="imageGenPrompt" class="image-gen-prompt">"{{ imageGenPrompt.length > 80 ? imageGenPrompt.slice(0, 80) + '…' : imageGenPrompt }}"</div>
+          <div class="image-gen-elapsed">{{ t('chat.imageGenElapsed', { seconds: imageGenElapsed }) }}</div>
+        </div>
       </div>
       <div
         v-if="hasToolChange"
@@ -1779,6 +1832,112 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
   flex-shrink: 0;
+}
+
+// ── Image generation progress card ──────────────────────────────
+.image-gen-progress {
+  display: flex;
+  gap: 14px;
+  padding: 14px 16px;
+  margin: 6px 0 4px 16px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(var(--primary-rgb, 99, 102, 241), 0.06), rgba(var(--primary-rgb, 99, 102, 241), 0.02));
+  border: 1px solid rgba(var(--primary-rgb, 99, 102, 241), 0.12);
+  animation: image-gen-fade-in 0.35s ease;
+}
+
+@keyframes image-gen-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.image-gen-canvas {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  background: rgba(var(--primary-rgb, 99, 102, 241), 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.image-gen-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    110deg,
+    transparent 30%,
+    rgba(var(--primary-rgb, 99, 102, 241), 0.12) 50%,
+    transparent 70%
+  );
+  animation: image-gen-shimmer 2s ease-in-out infinite;
+}
+
+@keyframes image-gen-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.image-gen-icon {
+  position: relative;
+  z-index: 1;
+  color: rgba(var(--primary-rgb, 99, 102, 241), 0.5);
+  animation: image-gen-pulse 2.5s ease-in-out infinite;
+}
+
+@keyframes image-gen-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50%      { opacity: 1; transform: scale(1.06); }
+}
+
+.image-gen-info {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.image-gen-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: $text-primary;
+}
+
+.image-gen-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(var(--primary-rgb, 99, 102, 241), 0.8);
+  animation: image-gen-dot-blink 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes image-gen-dot-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+
+.image-gen-prompt {
+  font-size: 12px;
+  color: $text-muted;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 360px;
+}
+
+.image-gen-elapsed {
+  font-size: 11px;
+  color: $text-muted;
+  font-variant-numeric: tabular-nums;
 }
 
 .tool-error-badge {

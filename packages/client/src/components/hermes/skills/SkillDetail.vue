@@ -234,17 +234,41 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
   height: 100%;
   display: flex;
   flex-direction: column;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .detail-title {
   flex-shrink: 0;
-  padding-bottom: 12px;
-  border-bottom: 1px solid $border-color;
-  margin-bottom: 12px;
+  padding: 16px 0;
+  border-bottom: 2px solid $border-color;
+  margin-bottom: 16px;
   font-size: 15px;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 16px;
+  position: relative;
+
+  &::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 0;
+    width: 60px;
+    height: 2px;
+    background: $accent-primary;
+    border-radius: 1px;
+  }
 }
 
 .detail-heading {
@@ -278,7 +302,7 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
 .usage-stats {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   margin-left: auto;
   flex-shrink: 0;
 }
@@ -286,14 +310,29 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
 .usage-stat {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   font-size: 13px;
   font-weight: 500;
   color: $text-secondary;
   white-space: nowrap;
+  padding: 6px 10px;
+  background: rgba(var(--accent-primary-rgb), 0.06);
+  border-radius: $radius-sm;
+  transition: all 0.2s ease;
 
   svg {
     opacity: 0.7;
+    transition: opacity 0.2s ease;
+  }
+
+  &:hover {
+    background: rgba(var(--accent-primary-rgb), 0.1);
+    color: $text-primary;
+    transform: translateY(-1px);
+
+    svg {
+      opacity: 1;
+    }
   }
 }
 
@@ -408,43 +447,71 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
 .detail-files {
   flex-shrink: 0;
   border-top: 1px solid $border-color;
-  padding-top: 12px;
-  margin-top: 12px;
-  max-height: 30vh;
+  padding-top: 16px;
+  margin-top: 16px;
+  max-height: 240px;
   overflow-y: auto;
 }
 
 .files-header {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   color: $text-muted;
   text-transform: uppercase;
-  letter-spacing: 0.3px;
-  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  &::before {
+    content: '';
+    width: 3px;
+    height: 12px;
+    background: $accent-primary;
+    border-radius: 2px;
+  }
 }
 
 .files-list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .file-item {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
+  gap: 8px;
+  padding: 8px 12px;
   border: 1px solid $border-color;
   border-radius: $radius-sm;
   background: $bg-secondary;
   color: $text-secondary;
   font-size: 12px;
   cursor: pointer;
-  transition: all $transition-fast;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  font-family: 'Courier New', monospace;
+
+  svg {
+    flex-shrink: 0;
+    opacity: 0.6;
+    transition: opacity 0.2s ease;
+  }
 
   &:hover {
     border-color: $accent-primary;
+    background: rgba(var(--accent-primary-rgb), 0.08);
     color: $accent-primary;
+    transform: translateX(4px);
+
+    svg {
+      opacity: 1;
+    }
+  }
+
+  &:active {
+    transform: translateX(4px) scale(0.98);
   }
 }
 

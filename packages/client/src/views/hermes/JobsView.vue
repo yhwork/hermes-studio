@@ -161,7 +161,7 @@ function arrowIcon(field: 'time' | 'name'): string {
 @use '@/styles/variables' as *;
 
 .jobs-view {
-  height: calc(100 * var(--vh));
+  height: 100%;
   display: flex;
   flex-direction: column;
 }

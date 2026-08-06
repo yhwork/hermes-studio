@@ -44,6 +44,8 @@ export * from './tools/skills'
 export * from './tools/terminal'
 export * from './tools/tool-result-sanitizer'
 export * from './tools/types'
+export * from './knowledge/types'
+export * from './tools/knowledge-base'
 export {
   AnthropicMessagesModelClient,
   normalizeAnthropicResponse,

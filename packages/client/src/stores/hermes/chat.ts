@@ -3053,7 +3053,7 @@ export const useChatStore = defineStore('chat', () => {
     })
   }
 
-  async function sendMessage(content: string, attachments?: Attachment[]) {
+  async function sendMessage(content: string, attachments?: Attachment[], displayContent?: string) {
     if ((!content.trim() && !(attachments && attachments.length > 0))) return
 
     primeCompletionBellIfEnabled()
@@ -3103,7 +3103,7 @@ export const useChatStore = defineStore('chat', () => {
     const userMsg: Message = {
       id: uid(),
       role: isBridgeSlashCommand ? 'command' : 'user',
-      content: submittedContent,
+      content: displayContent || submittedContent,
       timestamp: Date.now(),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
       queued: shouldQueue,
@@ -3158,6 +3158,8 @@ export const useChatStore = defineStore('chat', () => {
       } else {
         // No attachments: use plain text format
         input = submittedContent
+        // @-mention 子 agent 路由：实际发 input（委派指令），displayInput 为用户原文
+        if (displayContent) displayInput = displayContent
       }
 
       const appStore = useAppStore()

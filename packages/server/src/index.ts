@@ -193,6 +193,18 @@ async function startRuntimeServicesBeforeListen(): Promise<void> {
     logger.warn(err, '[bootstrap] agent bridge failed to start')
     console.warn('[bootstrap] agent bridge failed to start:', err instanceof Error ? err.message : err)
   }
+
+  // Pre-warm: trigger MCP discovery so configured servers are ready on page open.
+  if (agentBridgeManager) {
+    try {
+      const { getBridgeClient } = await import('./services/hermes/mcp')
+      const client = getBridgeClient()
+      await client.mcpReload()
+      console.log('[bootstrap] MCP servers pre-warmed')
+    } catch (err) {
+      logger.warn(err, '[bootstrap] MCP pre-warm failed (non-fatal)')
+    }
+  }
 }
 
 function startRuntimeServicesAfterListen(): void {
@@ -218,6 +230,17 @@ function startRuntimeServicesAfterListen(): void {
       logger.warn(err, '[bootstrap] agent bridge failed to start')
       console.warn('[bootstrap] agent bridge failed to start:', err instanceof Error ? err.message : err)
       return
+    }
+
+    // Pre-warm: trigger MCP discovery so configured servers are ready when
+    // the user opens the page, instead of waiting for the first message.
+    try {
+      const { getBridgeClient } = await import('./services/hermes/mcp')
+      const client = getBridgeClient()
+      await client.mcpReload()
+      console.log('[bootstrap] MCP servers pre-warmed')
+    } catch (err) {
+      logger.warn(err, '[bootstrap] MCP pre-warm failed (non-fatal)')
     }
   })()
 }
@@ -256,13 +279,13 @@ export async function bootstrap() {
       const injectionResult = await skillInjector.injectMissingSkills()
       if (injectionResult.injected.length > 0) {
         logger.info({
-          injected: [...new Set(injectionResult.injected)],
+          injected: Array.from(new Set(injectionResult.injected)),
           targetCount: injectionResult.targets.length,
         }, '[bootstrap] bundled skills injected')
       }
       if (injectionResult.updated.length > 0) {
         logger.info({
-          updated: [...new Set(injectionResult.updated)],
+          updated: Array.from(new Set(injectionResult.updated)),
           targetCount: injectionResult.targets.length,
         }, '[bootstrap] bundled skills updated')
       }
