@@ -1,5 +1,6 @@
 import { AgentBridgeClient } from './agent-bridge/client'
 import type { McpActionResponse } from './mcp-types'
+import { logger } from '../logger'
 
 export type { McpServerEntry, McpActionResponse } from './mcp-types'
 
@@ -10,6 +11,19 @@ export function getBridgeClient(): AgentBridgeClient {
     bridgeClient = new AgentBridgeClient()
   }
   return bridgeClient
+}
+
+/**
+ * After MCP config changes (add/remove/reload), destroy all existing sessions
+ * so the next message forces a fresh session with re-discovered tools.
+ */
+async function invalidateSessionsAfterMcpChange(client: AgentBridgeClient): Promise<void> {
+  try {
+    await client.destroyAll()
+    logger.info('[mcp] destroyed all sessions after MCP config change — tools will be re-discovered on next message')
+  } catch (err) {
+    logger.warn(err, '[mcp] failed to destroy sessions after MCP change (non-fatal)')
+  }
 }
 
 /**
@@ -32,6 +46,7 @@ export async function bridgeMcpAction(
       const addConfig = payload.config as Record<string, unknown> | undefined
       if (!addName || !addConfig) throw new Error('name and config are required')
       raw = await client.mcpAdd(addName, addConfig, profile)
+      void invalidateSessionsAfterMcpChange(client)
       break
     }
     case 'mcp_server_update': {
@@ -39,12 +54,14 @@ export async function bridgeMcpAction(
       const updConfig = payload.config as Record<string, unknown> | undefined
       if (!updName || !updConfig) throw new Error('name and config are required')
       raw = await client.mcpUpdate(updName, updConfig, profile)
+      void invalidateSessionsAfterMcpChange(client)
       break
     }
     case 'mcp_server_remove': {
       const rmName = String(payload.name || '')
       if (!rmName) throw new Error('name is required')
       raw = await client.mcpRemove(rmName, profile)
+      void invalidateSessionsAfterMcpChange(client)
       break
     }
     case 'mcp_server_test': {
@@ -58,6 +75,7 @@ export async function bridgeMcpAction(
       break
     case 'mcp_reload':
       raw = await client.mcpReload(payload.server as string | undefined, profile)
+      void invalidateSessionsAfterMcpChange(client)
       break
     default:
       throw new Error(`Unknown MCP action: ${action}`)

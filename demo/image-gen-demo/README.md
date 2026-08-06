@@ -88,31 +88,135 @@ curl -X POST http://127.0.0.1:8789/agent -H "Content-Type: application/json" \
 
 ---
 
-## 在 Hermes Studio 中使用（MCP）
+## MCP 接入
 
-在 Hermes Studio 的 MCP 面板注册（详见 [demo/agent-demo README](../agent-demo/README.md) 的同类说明）：
+### 方式一：页面操作
+
+1. 打开 Hermes Studio（`http://localhost:8649`）
+2. 进入 **设置 → MCP 服务器** 面板
+3. 点击 **+ 添加服务器**
+4. 选择 JSON 或 YAML 格式输入配置
+
+**stdio 模式（JSON）：**
 
 ```json
 {
-  "mcpServers": {
-    "image-gen-demo": {
-      "command": "C:\\nvm4w\\nodejs\\node.exe",
-      "args": [
-        "d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/node_modules/tsx/dist/cli.mjs",
-        "d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/src/mcp.ts"
-      ]
+  "image-gen-demo": {
+    "command": "C:\\nvm4w\\nodejs\\node.exe",
+    "args": [
+      "d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/node_modules/tsx/dist/cli.mjs",
+      "d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/src/mcp.ts"
+    ],
+    "env": {
+      "IMAGE_API_KEY": "sk-xxx",
+      "IMAGE_BASE_URL": "https://api.openai.com/v1",
+      "IMAGE_MODEL": "gpt-image-2"
     }
   }
 }
 ```
 
-> ⚠ 用绝对 `node.exe` + 绝对 `tsx` CLI + 绝对脚本路径。hermes-agent 网关 spawn stdio MCP 时固定以 hermes-studio 根目录为 CWD，**不认 `cwd` 字段**，bare specifier（如 `--import tsx`）会因根目录无 tsx 而失败。详见 agent-demo 的踩坑记录。
+**URL 模式（JSON，需先 `npm start`）：**
 
-注册后在对话里对父 Agent 说"画一张…"，父 Agent 会调用 `image_gen` / `agent_chat` 工具。
+```json
+{
+  "image-gen-demo": {
+    "url": "http://localhost:8789/mcp"
+  }
+}
+```
 
-### 工具描述可页面化配置
+**YAML 格式同样支持：**
 
-启动 HTTP 服务后打开 http://127.0.0.1:8789/config ，可在线编辑各工具描述（覆盖项写入 `descriptions.json`），保存后到 Hermes MCP 面板点「重载」即生效。把 `agent_chat` 描述改成"委派创意简报给自主生图子 agent"可提升 LLM 自动调用率。
+```yaml
+image-gen-demo:
+  command: C:\nvm4w\nodejs\node.exe
+  args:
+    - d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/node_modules/tsx/dist/cli.mjs
+    - d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/src/mcp.ts
+  env:
+    IMAGE_API_KEY: sk-xxx
+    IMAGE_BASE_URL: https://api.openai.com/v1
+    IMAGE_MODEL: gpt-image-2
+```
+
+5. 保存 → 点「获取工具列表」验证连通
+
+### 方式二：手动编辑 config.yaml
+
+文件位置：`C:\Users\<用户名>\AppData\Local\hermes\config.yaml`
+
+**stdio 模式：**
+
+```yaml
+mcp_servers:
+  image-gen-demo:
+    command: C:\nvm4w\nodejs\node.exe
+    args:
+      - d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/node_modules/tsx/dist/cli.mjs
+      - d:/qaweb/qaweb_tools/tools/hermes-studio/demo/image-gen-demo/src/mcp.ts
+    env:
+      IMAGE_API_KEY: sk-xxx
+      IMAGE_BASE_URL: https://api.openai.com/v1
+      IMAGE_MODEL: gpt-image-2
+```
+
+**URL 模式：**
+
+```yaml
+mcp_servers:
+  image-gen-demo:
+    url: http://localhost:8789/mcp
+```
+
+> ⚠ stdio 模式必须用**绝对路径**（node.exe + tsx cli + mcp.ts）。hermes-agent 网关 spawn 时固定以 hermes-studio 根为 CWD，bare specifier 会失败。
+
+### 方式三：其他平台 Agent 远程调用
+
+**HTTP REST：**
+
+```bash
+# 文生图
+curl -X POST http://<host>:8789/generate -H "Content-Type: application/json" \
+  -d '{"prompt":"a cat","size":"1024x1024"}'
+
+# 委派子 agent
+curl -X POST http://<host>:8789/agent -H "Content-Type: application/json" \
+  -d '{"message":"画一张赛博朋克猫"}'
+```
+
+**远程 hermes 实例：**
+
+```yaml
+mcp_servers:
+  image-gen-demo:
+    url: http://10.10.135.197:8789/mcp
+```
+
+**Node.js MCP Client：**
+
+```typescript
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+
+const transport = new StreamableHTTPClientTransport(new URL("http://localhost:8789/mcp"));
+const client = new Client({ name: "my-app", version: "1.0.0" });
+await client.connect(transport);
+const result = await client.callTool({ name: "image_gen", arguments: { prompt: "a cat" } });
+```
+
+### 调试
+
+```bash
+# 测试 stdio 连通
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | npx tsx src/mcp.ts
+
+# 测试 HTTP MCP
+curl -X POST http://localhost:8789/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream, application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+```
 
 ---
 

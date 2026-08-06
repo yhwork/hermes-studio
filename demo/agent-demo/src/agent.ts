@@ -10,6 +10,7 @@ import { createFileTools } from "../../../packages/ekko-agent/src/tools/files";
 import { createProviderConfig, requestStyleForConfig } from "../../../packages/ekko-agent/src/model/provider-config";
 import { createModelClient } from "../../../packages/ekko-agent/src/model/registry";
 import { loadModelConfig } from "./model-config.js";
+import { loadSkills } from "./skill-loader.js";
 
 /**
  * The agent — built on the SAME engine as Hermes (`ekko-agent`'s `AgentRuntime`).
@@ -56,6 +57,7 @@ export interface AgentConfig {
   apiMode?: string;
 }
 
+const HERE = typeof __dirname !== "undefined" ? __dirname : process.cwd();
 const MAX_STEPS = 12;
 const COMMAND_TIMEOUT_MS = 30_000;
 
@@ -65,11 +67,12 @@ function getRuntime(): AgentRuntime {
   if (runtimeCache) return runtimeCache;
   const registry = new AgentToolRegistry();
   registry.registerMany([...createTerminalTools(), ...createFileTools()]);
+  const skills = loadSkills(HERE);
   runtimeCache = new AgentRuntime({
     tools: registry,
     toolsEnabled: true,
-    skillsEnabled: false,
-    // modelClient is supplied per-run via AgentRuntimeRunInput.
+    skillsEnabled: skills.length > 0,
+    skills,
   });
   return runtimeCache;
 }

@@ -6,17 +6,22 @@ import type { AgentRuntimeRunResult } from "../../../packages/ekko-agent/src/run
 import { AgentToolRegistry } from "../../../packages/ekko-agent/src/tools/registry";
 import { createProviderConfig, requestStyleForConfig } from "../../../packages/ekko-agent/src/model/provider-config";
 import { createModelClient } from "../../../packages/ekko-agent/src/model/registry";
-import { GenerateImageTool, generateImage, describeInputForLocal, type GenerateImageInput, type ImageApiConfig, loadImageApiConfig } from "./image-tool.js";
+import {
+  HotNewsTool,
+  SearchNewsTool,
+  fetchHotNews,
+  searchNews,
+  formatHotNews,
+} from "./news-tool.js";
 import { loadModelConfig } from "./model-config.js";
-import { loadSkills } from "./skill-loader.js";
 
 /**
- * 生图子 agent —— 同样基于 Hermes 同款引擎（ekko-agent 的 AgentRuntime）。
+ * 新闻热点子 agent —— 基于 ekko-agent AgentRuntime（Hermes 同款引擎）。
  *
- * - LLM 模式：自己的模型客户端 + generate_image 工具，能理解创意简报、
- *   构造 prompt、按需多次生图/改图、给最终答复。
- * - local 模式（无 key 兜底）：把用户输入当 prompt 直接调 generate_image，
- *   证明「派发 → 生图 → 回传」链路通，不需要 LLM。
+ * LLM 模式：自己的模型客户端 + hot_news / search_news 工具，能理解复杂问题、
+ *   规划搜索策略、汇总多平台热点、生成分析报告。
+ * local 模式（无 key 兜底）：把用户输入拆解为平台/关键词直接调工具，
+ *   证明「派发 → 抓取 → 回传」链路通，不需要 LLM。
  */
 
 export interface AgentEvent {
@@ -50,10 +55,8 @@ export interface AgentConfig {
   model: string;
   provider: string;
   apiMode?: string;
-  imageApi: ImageApiConfig;
 }
 
-const HERE = typeof __dirname !== "undefined" ? __dirname : process.cwd();
 const MAX_STEPS = 12;
 
 let runtimeCache: AgentRuntime | null = null;
@@ -61,13 +64,11 @@ let runtimeCache: AgentRuntime | null = null;
 function getRuntime(): AgentRuntime {
   if (runtimeCache) return runtimeCache;
   const registry = new AgentToolRegistry();
-  registry.registerMany([new GenerateImageTool()]);
-  const skills = loadSkills(HERE);
+  registry.registerMany([new HotNewsTool(), new SearchNewsTool()]);
   runtimeCache = new AgentRuntime({
     tools: registry,
     toolsEnabled: true,
-    skillsEnabled: skills.length > 0,
-    skills,
+    skillsEnabled: false,
   });
   return runtimeCache;
 }
@@ -81,7 +82,6 @@ export function loadAgentConfig(): AgentConfig {
     model: m.model,
     provider: m.provider,
     apiMode: m.apiMode,
-    imageApi: loadImageApiConfig(),
   };
 }
 
@@ -90,7 +90,7 @@ export async function runAgent(
   config: AgentConfig,
   opts: AgentRunOptions = {},
 ): Promise<AgentRunResult> {
-  if (config.mode === "local") return runLocal(input, config, opts);
+  if (config.mode === "local") return runLocal(input, opts);
   return runEkko(input, config, opts);
 }
 
@@ -126,7 +126,10 @@ async function runEkko(
     model: config.model,
     maxSteps,
     signal: opts.signal,
-    toolContext: { cwd: opts.cwd ?? process.cwd(), workspaceRoot: opts.cwd ?? process.cwd() },
+    toolContext: {
+      cwd: opts.cwd ?? process.cwd(),
+      workspaceRoot: opts.cwd ?? process.cwd(),
+    },
     onEvent: (e: AgentRuntimeEvent) => emit(mapEkkoEvent(e)),
   });
 
@@ -141,13 +144,29 @@ async function runEkko(
   }
 
   const rawContent = result.output?.content;
-  const content = typeof rawContent === "string" ? rawContent : rawContent != null ? JSON.stringify(rawContent) : "";
+  const content =
+    typeof rawContent === "string"
+      ? rawContent
+      : rawContent != null
+      ? JSON.stringify(rawContent)
+      : "";
 
-  return { content, steps: result.steps.length, toolCalls, events, mode: "llm", model: config.model, finishedAt: new Date().toISOString() };
+  return {
+    content,
+    steps: result.steps.length,
+    toolCalls,
+    events,
+    mode: "llm",
+    model: config.model,
+    finishedAt: new Date().toISOString(),
+  };
 }
 
-/** local 兜底 —— 直接拿输入当 prompt 调 generate_image。 */
-async function runLocal(input: string, config: AgentConfig, opts: AgentRunOptions): Promise<AgentRunResult> {
+/** local 兜底 —— 直接调 fetchHotNews / searchNews，不需要 LLM。 */
+async function runLocal(
+  input: string,
+  opts: AgentRunOptions,
+): Promise<AgentRunResult> {
   const events: AgentEvent[] = [];
   const toolCalls: AgentRunResult["toolCalls"] = [];
   const emit = (type: string, data: Record<string, unknown>, step: number) => {
@@ -159,23 +178,77 @@ async function runLocal(input: string, config: AgentConfig, opts: AgentRunOption
   const step = 0;
   emit("agent.thinking", { step, mode: "local" }, step);
 
-  const prompt = describeInputForLocal(input);
-  const toolInput: GenerateImageInput = { prompt, mode: "text" };
-  emit("agent.tool_call", { name: "generate_image", args: toolInput }, step);
+  // 判断请求类型
+  const lowered = input.toLowerCase();
+  const isSearch =
+    lowered.includes("搜索") ||
+    lowered.includes("search") ||
+    lowered.includes("查找") ||
+    lowered.includes("查询");
 
-  const result = await generateImage(toolInput, config.imageApi);
-  const ok = result.ok;
-  emit("agent.tool_result", { name: "generate_image", ok, output: result.data ?? result.content }, step);
-  toolCalls.push({ name: "generate_image", args: toolInput, ok });
+  if (isSearch) {
+    // 提取关键词（去掉命令词）
+    const keyword = input
+      .replace(/搜索|查找|查询|search|新闻|关键词/gi, "")
+      .trim() || input;
+    emit("agent.tool_call", { name: "search_news", args: { keyword } }, step);
+    const result = await searchNews(keyword, 10);
+    const ok = !result.error || result.items.length > 0;
+    emit("agent.tool_result", { name: "search_news", ok, output: result }, step);
+    toolCalls.push({ name: "search_news", args: { keyword }, ok });
+    const content = ok
+      ? `搜索"${keyword}"结果 (${result.items.length} 条):\n\n` +
+        result.items
+          .map((i) => `${i.rank}. ${i.title}${i.url ? `\n   ${i.url}` : ""}`)
+          .join("\n\n")
+      : `搜索失败: ${result.error}。本地模式 — 配置 AGENT_MODEL_KEY 启用 LLM 引擎。`;
+    emit("agent.message", { content }, step);
+    return {
+      content,
+      steps: 1,
+      toolCalls,
+      events,
+      mode: "local",
+      finishedAt: new Date().toISOString(),
+    };
+  }
+
+  // 默认抓取全平台热榜
+  const platform = detectPlatform(input);
+  emit("agent.tool_call", { name: "hot_news", args: { platform, count: 20 } }, step);
+  const results = await fetchHotNews(platform, 20);
+  const ok = results.some((r) => r.items.length > 0);
+  emit("agent.tool_result", { name: "hot_news", ok, output: results }, step);
+  toolCalls.push({ name: "hot_news", args: { platform, count: 20 }, ok });
 
   const content = ok
-    ? `Generated an image for prompt: "${prompt}". ${result.content}`
-    : `Image generation failed: ${result.content}`;
+    ? formatHotNews(results)
+    : `获取热榜失败。本地模式 — 配置 AGENT_MODEL_KEY 启用 LLM 引擎。\n` +
+      results.map((r) => `[${r.platform}] ${r.error ?? "无数据"}`).join("\n");
+
   emit("agent.message", { content }, step);
-  return { content, steps: 1, toolCalls, events, mode: "local", finishedAt: new Date().toISOString() };
+  return {
+    content,
+    steps: 1,
+    toolCalls,
+    events,
+    mode: "local",
+    finishedAt: new Date().toISOString(),
+  };
 }
 
-/** 把 ekko-agent 事件映射成扁平事件流。 */
+/** 从输入文本中检测目标平台。 */
+function detectPlatform(input: string): string {
+  const lower = input.toLowerCase();
+  if (lower.includes("微博") || lower.includes("weibo")) return "weibo";
+  if (lower.includes("知乎") || lower.includes("zhihu")) return "zhihu";
+  if (lower.includes("百度") || lower.includes("baidu")) return "baidu";
+  if (lower.includes("抖音") || lower.includes("douyin")) return "douyin";
+  if (lower.includes("36kr") || lower.includes("36氪")) return "36kr";
+  return "all";
+}
+
+/** ekko-agent 事件映射。 */
 function mapEkkoEvent(e: AgentRuntimeEvent): AgentEvent {
   const step = "step" in e ? (e as { step: number }).step : 0;
   const ts = Date.now();

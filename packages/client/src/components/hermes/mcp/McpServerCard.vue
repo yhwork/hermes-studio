@@ -6,7 +6,7 @@ import type { McpServerInfo } from '@/api/hermes/mcp'
 
 const props = defineProps<{
   server: McpServerInfo
-  toolsByServer: Record<string, Array<{ name: string; description?: string }>>
+  tools: Array<{ name: string; description?: string }>
   loadingState?: { test?: boolean; reload?: boolean; remove?: boolean; toggle?: boolean; connecting?: boolean }
 }>()
 
@@ -37,7 +37,7 @@ function statusLabel(server: McpServerInfo) {
   return server.connected ? t('mcp.connectedStatus') : t('mcp.disconnectedStatus')
 }
 
-const tools = computed(() => props.toolsByServer[props.server.name] || [])
+const tools = computed(() => props.tools || [])
 const MAX_VISIBLE_TOOLS = 20
 </script>
 

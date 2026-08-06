@@ -1,0 +1,25 @@
+{
+  "name": "news-demo",
+  "version": "1.0.0",
+  "description": "新闻热点 agent — HTTP REST + MCP (stdio & Streamable HTTP) + interactive CLI. 获取微博/知乎/百度/抖音/36氪热榜。",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "dev": "tsx src/serve.ts",
+    "start": "tsx src/serve.ts",
+    "serve": "tsx src/serve.ts",
+    "serve:headless": "tsx src/serve.ts --no-interactive",
+    "mcp": "tsx src/mcp.ts",
+    "http": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

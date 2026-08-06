@@ -232,16 +232,17 @@ async function loadServers() {
   error.value = ''
   try {
     const data = await fetchMcpServers()
-    servers.value = data.servers ?? []
-    // Populate toolsByServer from embedded tool_details, including empty filtered results.
+    // 先构建 toolsByServer，再一起赋值 servers + toolsByServer，避免中间状态导致工具列表错乱
+    const newServers = data.servers ?? []
     const nextToolsByServer: Record<string, {name: string, description: string}[]> = {}
-    for (const s of servers.value) {
+    for (const s of newServers) {
       nextToolsByServer[s.name] = (s.tool_details || []).map(t => ({
         name: t.name,
         description: t.description || '',
       }))
     }
     toolsByServer.value = nextToolsByServer
+    servers.value = newServers
     // Auto-retry with exponential backoff if enabled servers are still disconnected
     const hasPending = servers.value.some(s => s.raw_config.enabled !== false && !s.connected)
     if (hasPending && _autoRetryCount < MAX_AUTO_RETRIES) {
@@ -606,7 +607,7 @@ async function saveToolsVisibility() {
             v-for="server in filteredServers"
             :key="server.name"
             :server="server"
-            :tools-by-server="toolsByServer"
+            :tools="toolsByServer[server.name] || []"
             :loading-state="loadingServers[server.name] || {}"
             @edit="openEditModal"
             @test="handleTest"
