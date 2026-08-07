@@ -1196,6 +1196,10 @@ async function handleSend() {
       text = buildDelegationText(mention.agent, mention.rest)
       displayText = raw // 对话气泡显示用户原文，不暴露系统委派指令
     }
+  } else if (attachments.value.some(a => a.type.startsWith('image/'))) {
+    // 有图片附件时，标记为图片分析 —— sendMessage 会直接调 vision-demo HTTP API
+    const imageCount = attachments.value.filter(a => a.type.startsWith('image/')).length
+    displayText = raw || `图片分析（${imageCount} 张）`
   }
 
   chatStore.sendMessage(text, attachments.value.length > 0 ? attachments.value : undefined, displayText)

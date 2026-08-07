@@ -1,3 +1,19 @@
+<script lang="ts">
+// Module-level cache (lives across component mount/unmount cycles — do NOT put
+// this inside <script setup>, which re-runs on every mount).
+// The MCP panel unmounts/remounts on every open (inline panel in ChatPanel +
+// route), and each mount used to re-fetch from scratch showing a spinner.
+// The Python agent bridge is single-threaded, so mcp_list queues behind
+// active chat runs (measured 90ms–1.1s). Seeding from this cache lets re-opened
+// panels render instantly, then refresh silently in the background.
+import type { McpServerInfo } from '@/api/hermes/mcp'
+interface McpCache {
+  servers: McpServerInfo[]
+  toolsByServer: Record<string, { name: string; description: string }[]>
+}
+let mcpCache: McpCache | null = null
+</script>
+
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
 import yaml from 'js-yaml'
@@ -17,8 +33,8 @@ import {
 const { t } = useI18n()
 const message = useMessage()
 
-const servers = ref<McpServerInfo[]>([])
-const loading = ref(false)
+const servers = ref<McpServerInfo[]>(mcpCache?.servers ?? [])
+const loading = ref(mcpCache ? false : true)
 const error = ref('')
 const searchQuery = ref('')
 
@@ -206,7 +222,7 @@ function parseAndValidate(text: string): { servers: Record<string, unknown>; err
   return { servers, error: '' }
 }
 
-const toolsByServer = ref<Record<string, {name: string, description: string}[]>>({})
+const toolsByServer = ref<Record<string, {name: string, description: string}[]>>(mcpCache?.toolsByServer ?? {})
 
 const summary = computed(() => {
   let connected = 0, totalTools = 0
@@ -227,8 +243,11 @@ const filteredServers = computed(() => {
   )
 })
 
-async function loadServers() {
-  loading.value = true
+async function loadServers(opts: { silent?: boolean } = {}) {
+  // If we already have data (from cache or a prior fetch), refresh silently —
+  // don't flash the full-screen spinner. Only show it on the very first load.
+  const hasData = servers.value.length > 0
+  if (!hasData && !opts.silent) loading.value = true
   error.value = ''
   try {
     const data = await fetchMcpServers()
@@ -243,8 +262,10 @@ async function loadServers() {
     }
     toolsByServer.value = nextToolsByServer
     servers.value = newServers
+    // Persist to module-level cache so the next mount renders instantly.
+    mcpCache = { servers: newServers, toolsByServer: nextToolsByServer }
     // Auto-retry with exponential backoff if enabled servers are still disconnected
-    const hasPending = servers.value.some(s => s.raw_config.enabled !== false && !s.connected)
+    const hasPending = newServers.some(s => s.raw_config.enabled !== false && !s.connected)
     if (hasPending && _autoRetryCount < MAX_AUTO_RETRIES) {
       const delay = BASE_RETRY_DELAY * Math.pow(2, _autoRetryCount) // 2s, 4s, 8s, 16s, 32s
       _autoRetryCount++

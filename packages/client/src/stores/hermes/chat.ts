@@ -3150,10 +3150,55 @@ export const useChatStore = defineStore('chat', () => {
           }
         }
 
-        // Build content blocks with uploaded file paths
-        input = await buildContentBlocks(submittedContent, attachments, uploaded)
-        if (attachments.some(attachment => attachment.context?.trim())) {
-          displayInput = await buildContentBlocks(submittedContent, attachments, uploaded, false)
+        // 图片分析：直接调 vision-demo HTTP API，不走主 agent MCP 工具
+        // （主 agent 的 MCP 工具会被回收/安全策略拦截 URL/内置 vision_analyze 不支持本地文件）
+        const hasImages = attachments.some(a => a.type.startsWith('image/'))
+        if (hasImages) {
+          const imagePaths = uploaded
+            .map((f, i) => ({ f, isImage: attachments[i]?.type.startsWith('image/') }))
+            .filter(x => x.isImage)
+            .map(x => x.f.path)
+          // 从 displayContent 提取用户问题（去掉 @agent 前缀和占位文本）
+          let userQuestion = (displayContent || submittedContent).replace(/^@[A-Za-z0-9_-]+\s*/, '').trim()
+          if (!userQuestion || userQuestion.startsWith('图片分析（')) {
+            userQuestion = '请详细描述这些图片的内容。'
+          }
+
+          let visionContent = ''
+          let visionError = ''
+          try {
+            const visionRes = await fetch('http://localhost:8791/analyze', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(imagePaths.length === 1
+                ? { image: imagePaths[0], question: userQuestion }
+                : { images: imagePaths, question: userQuestion }),
+              signal: AbortSignal.timeout(120_000),
+            })
+            const visionData = await visionRes.json().catch(() => ({})) as Record<string, unknown>
+            if (visionRes.ok && typeof visionData.content === 'string') {
+              const reasoning = typeof visionData.reasoning === 'string' && visionData.reasoning.trim()
+                ? `\n\n【思考过程】\n${visionData.reasoning}` : ''
+              visionContent = `${visionData.content}${reasoning}`
+            } else {
+              visionError = typeof visionData.error === 'string' ? visionData.error : `HTTP ${visionRes.status}`
+            }
+          } catch (err) {
+            visionError = err instanceof Error ? err.message : String(err)
+          }
+
+          if (visionContent) {
+            input = `用户上传了 ${imagePaths.length} 张图片并提问："${userQuestion}"。\n\n以下是 vision-demo 的图像分析结果，请基于此结果回复用户（可以补充见解、格式化输出，不要重复原始分析中的每个细节）：\n\n${visionContent}`
+          } else {
+            input = `用户上传了 ${imagePaths.length} 张图片并提问："${userQuestion}"。\n\n图片分析服务调用失败：${visionError}\n\n请告知用户图片分析服务暂时不可用，并尝试用文字描述你能帮助的内容。`
+          }
+          displayInput = displayContent || submittedContent
+        } else {
+          // Build content blocks with uploaded file paths
+          input = await buildContentBlocks(submittedContent, attachments, uploaded)
+          if (attachments.some(attachment => attachment.context?.trim())) {
+            displayInput = await buildContentBlocks(submittedContent, attachments, uploaded, false)
+          }
         }
       } else {
         // No attachments: use plain text format

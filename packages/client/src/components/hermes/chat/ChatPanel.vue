@@ -70,7 +70,7 @@ const WorkspaceDiffPreview = defineAsyncComponent(async () => (await import('@/c
 const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('./DesktopBrowserPanel.vue')).default);
 const SkillsView = defineAsyncComponent(async () => (await import('@/views/hermes/SkillsView.vue')).default);
 const PluginsView = defineAsyncComponent(async () => (await import('@/views/hermes/PluginsView.vue')).default);
-const McpManagerView = defineAsyncComponent(async () => (await import('@/views/hermes/McpManagerView.vue')).default);
+const McpManagerView = defineAsyncComponent(async () => (await import('@/views/hermes/MCPManagerView.vue')).default);
 const DelegationPanel = defineAsyncComponent(async () => (await import('./DelegationPanel.vue')).default);
 const KnowledgeBasePanel = defineAsyncComponent(async () => (await import('./KnowledgeBasePanel.vue')).default);
 const JobsView = defineAsyncComponent(async () => (await import('@/views/hermes/JobsView.vue')).default);
@@ -1926,10 +1926,10 @@ async function handleSessionModelCustomSubmit() {
       :class="{ collapsed: !showSessions }"
     >
       <div v-if="showSessions" class="page-sidebar-top">
+        <!-- 子 Agent 入口暂时注释（原: show-delegation） -->
         <PageSidebarNav
           :active="chatStore.runtimeMode === 'global_agent' ? 'global' : 'chat'"
           :primary-label="t('chat.newChat')"
-          show-delegation
           show-knowledge-base
           @primary="openNewChatModal"
         />

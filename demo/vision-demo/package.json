@@ -1,7 +1,7 @@
 {
-  "name": "news-demo",
+  "name": "vision-demo",
   "version": "1.0.0",
-  "description": "新闻热点 agent — HTTP REST + MCP (stdio & Streamable HTTP) + interactive CLI. 获取微博/知乎/百度/抖音/36氪热榜。",
+  "description": "图像识别分析 agent — HTTP REST + MCP (stdio & Streamable HTTP) + interactive CLI. 支持图像分析/对比/OCR/描述，带思考过程。",
   "scripts": {
     "build": "tsc --noEmit",
     "bundle": "node build.mjs",
