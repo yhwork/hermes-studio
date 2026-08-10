@@ -50,6 +50,7 @@ import { runtimeVersionRoutes } from './hermes/runtime-versions'
 import { writeGateRoutes } from './hermes/write-gate'
 import { petdexPublicRoutes, petdexRoutes } from './hermes/petdex'
 import { petRoutes } from './hermes/pets'
+import { xmindParseRoutes } from './hermes/xmind-parse'
 
 /**
  * Register all routes on the Koa app.

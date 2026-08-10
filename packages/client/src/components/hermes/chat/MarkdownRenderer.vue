@@ -227,12 +227,20 @@ const renderedHtml = computed(() => {
     }
 
     // Other files: render as file card
+    const isXmindFile = hasExtension(path, new Set(['xmind']))
+    const xmindButton = isXmindFile ? `<button class="att-view-btn" type="button" title="查看用例" aria-label="查看用例" data-xmind-path="${path}">
+        <svg class="att-view-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+          <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+        </svg>
+      </button>` : ''
     return `<div class="markdown-file-card" data-path="${path}" data-filename="${downloadName}" title="${t('download.downloadFile')}">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
         <polyline points="14 2 14 8 20 8" />
       </svg>
       <span class="att-name">${fileName}</span>
+      ${xmindButton}
       <button class="att-download-btn" type="button" title="${t('download.downloadFile')}" aria-label="${t('download.downloadFile')}">
         <svg class="att-download-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -419,6 +427,14 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
     event.stopPropagation()
     const path = fileCard.getAttribute('data-path')
     const fileName = fileCard.getAttribute('data-filename') || undefined
+
+    // Handle view button click for xmind files
+    const viewBtn = target.closest('.att-view-btn')
+    if (viewBtn && path) {
+      const xmindPath = viewBtn.getAttribute('data-xmind-path') || path
+      window.location.hash = `/hermes/cases?path=${encodeURIComponent(xmindPath)}`
+      return
+    }
 
     const isDownloadBtn = target.closest('.att-download-btn')
 
@@ -667,6 +683,12 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
       transition: opacity 0.15s ease;
     }
 
+    .att-view-icon {
+      flex-shrink: 0;
+      opacity: 0.7;
+      transition: opacity 0.15s ease;
+    }
+
     .att-download-btn {
       display: inline-flex;
       align-items: center;
@@ -681,8 +703,33 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
       cursor: pointer;
     }
 
+    .att-view-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      color: var(--accent-primary);
+      background: rgba(var(--accent-primary-rgb), 0.08);
+      border: 0;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease;
+
+      &:hover {
+        background: rgba(var(--accent-primary-rgb), 0.18);
+        color: var(--accent-hover);
+      }
+    }
+
     &:hover .att-download-icon,
     .att-download-btn:hover .att-download-icon {
+      opacity: 1;
+    }
+
+    &:hover .att-view-icon {
       opacity: 1;
     }
   }

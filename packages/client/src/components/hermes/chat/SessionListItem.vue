@@ -18,10 +18,12 @@ const props = withDefaults(defineProps<{
   selectable?: boolean
   selected?: boolean
   showProfile?: boolean
+  showAgentRow?: boolean
   to?: string
   interceptModifiedNavigation?: boolean
 }>(), {
   showProfile: true,
+  showAgentRow: true,
 })
 
 const emit = defineEmits<{
@@ -157,7 +159,7 @@ onUnmounted(() => {
         </span>
         <span class="session-item-time">{{ formatTimestampMs(session.createdAt) }}</span>
       </span>
-      <span class="session-item-agent-row">
+      <span v-if="showAgentRow" class="session-item-agent-row">
         <span class="session-item-agent-logo-wrap" :class="{ streaming }">
           <img
             class="session-item-agent-logo"
@@ -207,47 +209,74 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  padding: 8px 10px;
+  padding: 9px 12px 9px 14px;
   border: none;
   background: none;
-  border-radius: var(--radius-sm);
+  border-radius: 8px;
   cursor: pointer;
   text-align: left;
   text-decoration: none;
   color: var(--text-secondary);
-  transition: all var(--transition-fast);
-  margin-bottom: 2px;
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
+  margin-bottom: 1px;
+}
+
+/* Signature accent bar — grows on the active item */
+.session-item::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 2px;
+  height: 0;
+  border-radius: 2px;
+  background: var(--accent-primary);
+  transform: translateY(-50%);
+  opacity: 0;
+  transition:
+    height var(--transition-fast),
+    opacity var(--transition-fast);
 }
 
 .session-item:hover {
-  background: rgba(var(--accent-primary-rgb), 0.06);
+  background: rgba(var(--accent-primary-rgb), 0.05);
   color: var(--text-primary);
 }
 
-.session-item:hover .session-item-delete {
-  opacity: 1;
-  pointer-events: auto;
+.session-item:hover .session-item-title {
+  color: var(--text-primary);
 }
 
+.session-item:hover .session-item-delete,
 .session-item:focus-within .session-item-delete {
   opacity: 1;
   pointer-events: auto;
 }
 
 .session-item.active {
-  background: rgba(var(--accent-primary-rgb), 0.12);
+  background: rgba(var(--accent-primary-rgb), 0.10);
   color: var(--text-primary);
-  font-weight: 500;
-  border-radius: 6px;
+}
+
+.session-item.active::before {
+  height: 56%;
+  opacity: 1;
 }
 
 .session-item.active .session-item-title {
   color: var(--accent-primary);
+  font-weight: 500;
 }
 
 .session-item.missing-models {
   color: #b42318;
   background: rgba(220, 38, 38, 0.08);
+}
+
+.session-item.missing-models::before {
+  background: #b42318;
 }
 
 .session-item.missing-models .session-item-title,
@@ -277,7 +306,7 @@ onUnmounted(() => {
 .session-item-title-main {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   flex: 1 1 auto;
   min-width: 0;
 }
@@ -287,9 +316,13 @@ onUnmounted(() => {
   flex: 1 1 auto;
   min-width: 0;
   font-size: 13px;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: inherit;
+  transition: color var(--transition-fast);
 }
 
 .session-item-pin {
@@ -298,6 +331,7 @@ onUnmounted(() => {
   justify-content: center;
   flex-shrink: 0;
   color: var(--accent-primary);
+  opacity: 0.85;
 }
 
 .session-item-unread-dot {
@@ -306,33 +340,46 @@ onUnmounted(() => {
   height: 6px;
   border-radius: 50%;
   background: var(--accent-primary);
-  box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.12);
+  box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.14);
+  animation: session-unread-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes session-unread-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.14);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(var(--accent-primary-rgb), 0.24);
+  }
 }
 
 .session-item-time {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 .session-item-global-icon {
   position: absolute;
-  top: 5px;
-  right: 5px;
+  top: 6px;
+  right: 6px;
   color: #d6a019;
   pointer-events: none;
+  opacity: 0.9;
 }
 
 .session-item-delete {
   flex-shrink: 0;
   opacity: 0;
   pointer-events: none;
-  padding: 2px;
+  padding: 3px;
   border: none;
   background: none;
   color: var(--text-muted);
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: 5px;
   transition: all var(--transition-fast);
 }
 
@@ -371,18 +418,25 @@ onUnmounted(() => {
 
 .session-item-warning {
   flex-shrink: 0;
-  width: 16px;
-  height: 16px;
-  border: 1px solid rgba(180, 35, 24, 0.35);
+  width: 15px;
+  height: 15px;
+  border: 1px solid rgba(180, 35, 24, 0.4);
   border-radius: 50%;
-  background: rgba(220, 38, 38, 0.1);
+  background: rgba(220, 38, 38, 0.12);
   color: #b42318;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
-  line-height: 14px;
+  line-height: 13px;
+  text-align: center;
   cursor: pointer;
+  transition: background var(--transition-fast);
 }
 
+.session-item-warning:hover {
+  background: rgba(220, 38, 38, 0.2);
+}
+
+/* agent-row preserved (hidden via showAgentRow prop) */
 .session-item-agent-row {
   display: flex;
   align-items: center;

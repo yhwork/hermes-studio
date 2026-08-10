@@ -348,6 +348,10 @@ function handleBrowserAttachment(payload: { file: File; context: string }) {
 
 async function handleSessionClick(sessionId: string) {
   chatStore.clearSessionCompletedUnread(sessionId);
+  // 让右侧内容回到对话：关闭内嵌管理面板 / 工具面板 / 子 Agent 流。
+  // 即使点击的是当前会话也执行，这样用户可以从 skills/files 等视图回到对话。
+  inlineView.value = null;
+  closeToolPanelOverlay();
   await router.push({
     name: chatStore.runtimeMode === "global_agent" ? "hermes.globalAgentSession" : "hermes.session",
     params: { sessionId },
@@ -2080,6 +2084,7 @@ async function handleSessionModelCustomSubmit() {
             :selectable="isBatchMode"
             :selected="isSessionSelected(s)"
             :show-profile="true"
+            :show-agent-row="false"
             :to="sessionHref(s.id)"
             :intercept-modified-navigation="desktopChatWindowAvailable"
             @select="handleSessionClick(s.id)"
@@ -2127,6 +2132,7 @@ async function handleSessionModelCustomSubmit() {
               :selectable="isBatchMode"
               :selected="isSessionSelected(s)"
               :show-profile="true"
+              :show-agent-row="false"
               :to="sessionHref(s.id)"
               :intercept-modified-navigation="desktopChatWindowAvailable"
               @select="handleSessionClick(s.id)"
@@ -3412,10 +3418,20 @@ async function handleSessionModelCustomSubmit() {
 .session-group-header {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 6px 10px 4px;
+  gap: 6px;
+  padding: 16px 12px 6px;
   cursor: pointer;
   user-select: none;
+  position: relative;
+
+  &::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: $border-color;
+    opacity: 0.55;
+    margin-left: 6px;
+  }
 }
 
 .session-group-header--static {
@@ -3424,6 +3440,7 @@ async function handleSessionModelCustomSubmit() {
 
 .group-chevron {
   flex-shrink: 0;
+  color: $text-muted;
   transition: transform 0.15s ease;
   transform: rotate(90deg);
 
@@ -3437,19 +3454,24 @@ async function handleSessionModelCustomSubmit() {
   font-weight: 600;
   color: $text-muted;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.08em;
 }
 
 .session-group-count {
   font-size: 10px;
   color: $text-muted;
-  font-weight: 400;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  background: rgba(var(--accent-primary-rgb), 0.06);
+  padding: 0 6px;
+  border-radius: 4px;
+  line-height: 16px;
 }
 
 .session-items {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 6px 12px;
+  padding: 6px 8px 14px;
 }
 
 .page-sidebar-bottom {
