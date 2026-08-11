@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MCU_VOICE_SYSTEM_INSTRUCTIONS } from '../../packages/server/src/services/global-agent/mcu-voice-instructions'
 
 const { mockIo, mockSocket, sockets, socketHandlers, mockWebSockets, MockWebSocket, resetMockSockets } = vi.hoisted(() => {
   function createMockSocket(id: string, url = '') {
@@ -123,6 +124,29 @@ describe('outbound relay client', () => {
     const runCall = socket.emit.mock.calls
       .filter(([event]: [string]) => event === 'run')
       .at(-1)
+    expect(runCall?.[1]).toMatchObject({
+      source: 'coding_agent',
+      session_source: 'global_agent',
+      coding_agent_id: 'ekko-agent',
+      instructions: MCU_VOICE_SYSTEM_INSTRUCTIONS,
+    })
+    const queueId = runCall?.[1]?.queue_id
+    expect(queueId).toMatch(/^mcu_/)
+    socket.__handlers.get('run.started')?.({ run_id: runId, queue_id: queueId })
+    return queueId
+  }
+
+  function startHermesPrimaryMockRun(socket: any, runId = 'run-primary'): string {
+    const runCall = socket.emit.mock.calls
+      .filter(([event]: [string]) => event === 'run')
+      .at(-1)
+    expect(runCall?.[1]).toMatchObject({
+      session_id: 'mcu-device-research-hermes',
+      source: 'global_agent',
+      session_source: 'global_agent',
+      instructions: MCU_VOICE_SYSTEM_INSTRUCTIONS,
+    })
+    expect(runCall?.[1]).not.toHaveProperty('coding_agent_id')
     const queueId = runCall?.[1]?.queue_id
     expect(queueId).toMatch(/^mcu_/)
     socket.__handlers.get('run.started')?.({ run_id: runId, queue_id: queueId })
@@ -319,6 +343,7 @@ describe('outbound relay client', () => {
     emitRemote(remoteSocket, 'voice.stream.start', {
       type: 'voice.stream.start',
       interactionId: 'voice-stream-1',
+      agentRuntime: 'hermes',
       mimeType: 'audio/x-ima-adpcm',
       frameFormat: 'hadp-chunk-v1',
       sampleRate: 24000,
@@ -342,6 +367,7 @@ describe('outbound relay client', () => {
       mimeType: 'audio/x-ima-adpcm',
       frameFormat: 'hadp-chunk-v1',
       profile: 'default',
+      agentRuntime: 'hermes',
     }))
     expect(localGlobalAgentSocket.emit).toHaveBeenCalledWith('voice.stream.chunk', expect.objectContaining({
       interactionId: 'voice-stream-1',
@@ -518,6 +544,7 @@ describe('outbound relay client', () => {
       interactionId: 'voice-tts-ok',
       mimeType: 'audio/wav',
       profile: 'research',
+      agentRuntime: 'hermes',
     })
     emitRemote(remoteSocket, 'voice.stream.chunk', {
       type: 'voice.stream.chunk',
@@ -529,13 +556,48 @@ describe('outbound relay client', () => {
     })
     const localSocket = socketForUrl('http://127.0.0.1:8648/chat-run')
     localSocket.__handlers.get('connect')?.()
-    startPrimaryMockRun(localSocket)
-    localSocket.__handlers.get('message.delta')?.({ delta: '你好' })
-    localSocket.__handlers.get('run.completed')?.({})
+    startHermesPrimaryMockRun(localSocket)
+    expect(fetchImpl.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'X-Hermes-Mcu-Agent-Runtime': 'hermes',
+    })
+    localSocket.__handlers.get('message.delta')?.({ delta: '我来查一下。\n' })
+    localSocket.__handlers.get('tool.started')?.({
+      tool: 'weather',
+      preview: 'tool arguments must stay local'.repeat(1_000),
+    })
+    localSocket.__handlers.get('tool.completed')?.({
+      tool: 'weather',
+      preview: 'tool result must stay local'.repeat(1_000),
+    })
+    expect(remoteSocket.emit).toHaveBeenCalledWith('tool.started', {
+      type: 'tool.started',
+      interactionId: 'voice-tts-ok',
+      tool: 'weather',
+    })
+    expect(remoteSocket.emit).toHaveBeenCalledWith('tool.completed', {
+      type: 'tool.completed',
+      interactionId: 'voice-tts-ok',
+      tool: 'weather',
+      error: undefined,
+    })
+    localSocket.__handlers.get('run.completed')?.({ output: '厦门今天晴。' })
 
     await vi.waitFor(() => {
       expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+        text: '我来查一下。',
         url: 'http://device.local:8787/global-agent/audio/audio-1?token=download-token',
+      }))
+    })
+    emitRemote(remoteSocket, 'audio.done', {
+      type: 'audio.done',
+      interactionId: 'voice-tts-ok',
+      segmentId: 'voice-tts-ok-tts-1',
+    })
+    await vi.waitFor(() => {
+      expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+        interactionId: 'voice-tts-ok',
+        segmentId: 'voice-tts-ok-tts-2',
+        text: '厦门今天晴。',
       }))
     })
     const uploadCall = fetchImpl.mock.calls.find(([url]: [string]) => url === 'http://device.local:8787/global-agent/audio')
@@ -648,6 +710,7 @@ describe('outbound relay client', () => {
       expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
         interactionId: 'mcu-background-delegation-1',
         segmentId: 'mcu-background-delegation-1-tts-1',
+        text: '厦门明天晴，最高温度 30 度。',
         completionManagedByServer: true,
       }))
     })
@@ -796,7 +859,7 @@ describe('outbound relay client', () => {
     await vi.waitFor(() => {
       expect(ttsSignal?.aborted).toBe(true)
     })
-    expect(localSocket.emit).toHaveBeenCalledWith('abort', { session_id: 'mcu-device-research' })
+    expect(localSocket.emit).toHaveBeenCalledWith('abort', { session_id: 'mcu-device-research-ekko' })
     expect(remoteSocket.emit).not.toHaveBeenCalledWith('audio.enqueue', expect.any(Object))
   })
 

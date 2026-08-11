@@ -8,6 +8,7 @@ export interface ActiveVersionManifest {
   runtimeRootDirectory?: string
   pendingRuntimeRootDirectory?: string
   runtimeMigrationError?: string
+  runtimeActivationError?: string
   webUiDirectory?: string
   platform?: string
   updatedAt?: string
@@ -57,11 +58,13 @@ export interface RuntimeVersionStatus {
   remoteError: string
   hermes: {
     activeVersion: string
+    agentVersion: string
     activeDirectory: string
     storageDirectory: string
     defaultStorageDirectory: string
     pendingStorageDirectory: string
     migrationError: string
+    activationError: string
     installed: InstalledRuntimeVersion[]
     remoteVersions: string[]
   }

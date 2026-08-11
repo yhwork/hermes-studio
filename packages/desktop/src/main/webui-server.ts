@@ -10,6 +10,7 @@ import {
   bundledAgentBrowserHome,
   bundledGit,
   bundledNode,
+  bundledPython,
   gitPathDirs,
   clearActiveWebUiDirectory,
   defaultWebuiDir,
@@ -21,6 +22,7 @@ import {
   nodeBinDir,
   tokenFile,
   pythonDir,
+  pythonEnvironmentDir,
 } from './paths'
 
 const DEFAULT_PORT = 8748
@@ -360,9 +362,8 @@ export async function startWebUiServer(port = DEFAULT_PORT): Promise<string> {
   // setup is a #!/bin/sh wrapper, not a python interpreter, so detection
   // resolves to /bin/sh and the bridge crashes (exit code 2) immediately.
   const isWin = process.platform === 'win32'
-  const bundledPython = isWin
-    ? join(pythonDir(), 'python.exe')
-    : join(pythonDir(), 'bin', 'python3')
+  const bundledPythonPath = bundledPython()
+  const bundledPythonEnvironment = pythonEnvironmentDir()
   const bundledAgentBrowserBin = isWin
     ? join(pythonDir(), 'node')
     : join(pythonDir(), 'node', 'bin')
@@ -396,9 +397,15 @@ export async function startWebUiServer(port = DEFAULT_PORT): Promise<string> {
     // The bridge and its per-profile workers need working stdout/stderr for
     // ready handshakes. Use python.exe on Windows and hide windows at the
     // process creation layer instead of switching the bridge to pythonw.exe.
-    HERMES_AGENT_BRIDGE_PYTHON: bundledPython,
-    HERMES_AGENT_CLI_PYTHON: bundledPython,
+    HERMES_AGENT_BRIDGE_PYTHON: bundledPythonPath,
+    HERMES_AGENT_CLI_PYTHON: bundledPythonPath,
     HERMES_AGENT_ROOT: pythonDir(),
+    VIRTUAL_ENV: bundledPythonEnvironment,
+    UV_PROJECT_ENVIRONMENT: bundledPythonEnvironment,
+    // Keep uv pinned to the bundled interpreter when a terminal subprocess
+    // deliberately strips VIRTUAL_ENV to protect unrelated user projects.
+    UV_PYTHON: bundledPythonPath,
+    ...(isWin ? {} : { UV_SYSTEM_PYTHON: '1' }),
     HERMES_AGENT_NODE: bundledNode(),
     HERMES_AGENT_NODE_ROOT: isWin ? bundledNodeBin : dirname(bundledNodeBin),
     AGENT_BROWSER_HOME: process.env.AGENT_BROWSER_HOME?.trim() || bundledAgentBrowserHome(),

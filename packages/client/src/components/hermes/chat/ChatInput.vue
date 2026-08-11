@@ -22,7 +22,13 @@ import { useMicRecorder } from '@/composables/useMicRecorder'
 import { usePcmStreamRecorder } from '@/composables/usePcmStreamRecorder'
 import { useGlobalSpeech } from '@/composables/useSpeech'
 import { useVoiceDialogue } from '@/composables/useVoiceDialogue'
-import { transcribeSpeech } from '@/api/hermes/stt'
+import {
+  cancelLocalSttStream,
+  finishLocalSttStream,
+  pushLocalSttStreamChunk,
+  startLocalSttStream,
+  transcribeSpeech,
+} from '@/api/hermes/stt'
 import type { StoredSttProvider } from '@/api/hermes/stt-settings'
 import { useSttSettings } from '@/composables/useSttSettings'
 import { useBrowserSpeechRecognition } from '@/composables/useBrowserSpeechRecognition'
@@ -144,6 +150,15 @@ const pcmRecorder = usePcmStreamRecorder({
     recordingFailed: t('chat.voiceInput.microphoneRecordingFailed'),
   },
 })
+const localPcmRecorder = usePcmStreamRecorder({
+  continuous: true,
+  maxSegmentDurationMs: 1_000,
+  onChunk: queueLocalStreamChunk,
+  messages: {
+    unsupported: t('chat.voiceInput.microphoneUnsupported'),
+    recordingFailed: t('chat.voiceInput.microphoneRecordingFailed'),
+  },
+})
 const sttSettings = useSttSettings()
 const browserRecognition = useBrowserSpeechRecognition({
   messages: {
@@ -152,7 +167,13 @@ const browserRecognition = useBrowserSpeechRecognition({
     failedWithReason: (reason) => t('chat.voiceInput.browserSpeechFailedWithReason', { error: reason }),
   },
 })
-const activeVoiceCaptureMode = ref<'browser' | 'backend' | 'pcm' | null>(null)
+const activeVoiceCaptureMode = ref<'browser' | 'backend' | 'pcm' | 'local' | null>(null)
+const localStreamTranscript = ref('')
+const localStreamError = ref<Error | null>(null)
+let localStreamSessionId: string | null = null
+let localStreamGeneration = 0
+let localStreamQueue: Promise<void> = Promise.resolve()
+let localStreamFailure: unknown = null
 const configuredTextareaHeight = computed(() =>
   isMobileViewport.value ? null : clampChatInputHeight(settingsStore.display.chat_input_height),
 )
@@ -189,6 +210,12 @@ function backendTranscribeOptions(): {
   if (sttSettings.provider.value === 'doubao') {
     return {
       provider: 'doubao',
+    }
+  }
+
+  if (sttSettings.provider.value !== 'browser') {
+    return {
+      provider: sttSettings.provider.value,
     }
   }
 
@@ -256,6 +283,9 @@ const voiceDialogue = useVoiceDialogue({
   stopOutputAudio: () => speech.stop(true),
 })
 const voiceDialogueTranscript = computed(() => {
+  if (activeVoiceCaptureMode.value === 'local' && voiceDialogue.status.value === 'capturing') {
+    return localStreamTranscript.value
+  }
   if (activeVoiceCaptureMode.value !== 'browser' || voiceDialogue.status.value !== 'capturing') {
     return voiceDialogue.transcript.value
   }
@@ -270,7 +300,9 @@ const shouldShowBrowserRecognitionError = computed(() =>
 )
 const voiceDialogueError = computed(() =>
   voiceDialogue.error.value?.message
+  ?? localStreamError.value?.message
   ?? (shouldShowBrowserRecognitionError.value ? browserRecognition.error.value?.message : null)
+  ?? localPcmRecorder.error.value?.message
   ?? pcmRecorder.error.value?.message
   ?? micRecorder.state.value.error?.message
   ?? null,
@@ -1213,19 +1245,80 @@ async function handleSend() {
   }
 }
 
+function resetLocalStreamCapture() {
+  localStreamGeneration += 1
+  localStreamQueue = Promise.resolve()
+  localStreamFailure = null
+  localStreamTranscript.value = ''
+  localStreamError.value = null
+}
+
+async function cancelActiveLocalStreamCapture() {
+  const sessionId = localStreamSessionId
+  localStreamSessionId = null
+  if (!sessionId) return
+  await cancelLocalSttStream(sessionId).catch(() => undefined)
+}
+
+function failLocalStreamCapture(cause: unknown, generation: number) {
+  if (generation !== localStreamGeneration) return
+  localStreamFailure = cause
+  localStreamError.value = cause instanceof Error ? cause : new Error(String(cause))
+  localPcmRecorder.cancel()
+  activeVoiceCaptureMode.value = null
+  const captureId = voiceDialogue.activeCaptureId.value
+  localStreamGeneration += 1
+  void cancelActiveLocalStreamCapture()
+  voiceDialogue.cancelCapture(captureId)
+}
+
+function queueLocalStreamChunk(audio: Blob) {
+  const generation = localStreamGeneration
+  const sessionId = localStreamSessionId
+  if (!sessionId || audio.size <= 44) return localStreamQueue
+
+  localStreamQueue = localStreamQueue.then(async () => {
+    if (generation !== localStreamGeneration) return
+    const result = await pushLocalSttStreamChunk(sessionId, audio)
+    if (generation !== localStreamGeneration) return
+    localStreamTranscript.value = normalizeVoiceTranscript(result.text)
+  }).catch(cause => failLocalStreamCapture(cause, generation))
+
+  return localStreamQueue
+}
+
 async function startVoiceCapture() {
   browserRecognition.clearError()
+  localStreamError.value = null
   const { captureId } = await voiceDialogue.beginCapture()
   const useBrowserProvider = sttSettings.provider.value === 'browser'
-  const usePcmCapture = !useBrowserProvider && (isDesktopShell() || isMobileDevice())
+  const useLocalProvider = sttSettings.provider.value === 'local'
+  const usePcmCapture = !useBrowserProvider && !useLocalProvider && (isDesktopShell() || isMobileDevice())
 
   activeVoiceCaptureMode.value = useBrowserProvider
     ? 'browser'
-    : usePcmCapture ? 'pcm' : 'backend'
+    : useLocalProvider ? 'local' : usePcmCapture ? 'pcm' : 'backend'
 
   try {
     if (useBrowserProvider) {
       await browserRecognition.start({ language: browserCaptureLanguage() })
+      return
+    }
+
+    if (useLocalProvider) {
+      resetLocalStreamCapture()
+      const generation = localStreamGeneration
+      const session = await startLocalSttStream()
+      if (
+        generation !== localStreamGeneration
+        || activeVoiceCaptureMode.value !== 'local'
+        || voiceDialogue.activeCaptureId.value !== captureId
+      ) {
+        await cancelLocalSttStream(session.sessionId).catch(() => undefined)
+        return
+      }
+      localStreamSessionId = session.sessionId
+      await localPcmRecorder.start()
       return
     }
 
@@ -1234,7 +1327,13 @@ async function startVoiceCapture() {
     } else {
       await micRecorder.start()
     }
-  } catch {
+  } catch (cause) {
+    if (useLocalProvider) {
+      localStreamError.value = cause instanceof Error ? cause : new Error(String(cause))
+      localStreamGeneration += 1
+      localPcmRecorder.cancel()
+      await cancelActiveLocalStreamCapture()
+    }
     activeVoiceCaptureMode.value = null
     voiceDialogue.cancelCapture(captureId)
   }
@@ -1261,6 +1360,44 @@ async function stopVoiceCapture() {
       await voiceDialogue.commitTranscript(captureId, transcript)
     } catch {
       // Voice dialogue state already tracks send errors.
+    }
+    return
+  }
+
+  if (activeVoiceCaptureMode.value === 'local') {
+    const generation = localStreamGeneration
+    const sessionId = localStreamSessionId
+    if (!sessionId || localPcmRecorder.status.value === 'requesting') {
+      localStreamGeneration += 1
+      localPcmRecorder.cancel()
+      activeVoiceCaptureMode.value = null
+      await cancelActiveLocalStreamCapture()
+      voiceDialogue.cancelCapture(captureId)
+      return
+    }
+
+    try {
+      const finalChunk = await localPcmRecorder.stop()
+      if (finalChunk) queueLocalStreamChunk(finalChunk)
+      await localStreamQueue
+      if (generation !== localStreamGeneration) return
+      if (localStreamFailure) throw localStreamFailure
+
+      localStreamSessionId = null
+      const result = await finishLocalSttStream(sessionId)
+      if (generation !== localStreamGeneration) return
+      localStreamTranscript.value = normalizeVoiceTranscript(result.text) || localStreamTranscript.value
+      activeVoiceCaptureMode.value = null
+      await voiceDialogue.commitTranscript(captureId, localStreamTranscript.value)
+      localStreamTranscript.value = ''
+    } catch (cause) {
+      if (generation !== localStreamGeneration) return
+      localStreamError.value = cause instanceof Error ? cause : new Error(String(cause))
+      localStreamGeneration += 1
+      localPcmRecorder.cancel()
+      activeVoiceCaptureMode.value = null
+      await cancelActiveLocalStreamCapture()
+      voiceDialogue.cancelCapture(captureId)
     }
     return
   }
@@ -1306,6 +1443,12 @@ async function stopVoiceCapture() {
 function cancelVoiceCapture() {
   if (activeVoiceCaptureMode.value === 'browser') {
     browserRecognition.cancel()
+  } else if (activeVoiceCaptureMode.value === 'local') {
+    localStreamGeneration += 1
+    localPcmRecorder.cancel()
+    void cancelActiveLocalStreamCapture()
+    localStreamTranscript.value = ''
+    localStreamError.value = null
   } else if (activeVoiceCaptureMode.value === 'pcm') {
     pcmRecorder.cancel()
   } else {
@@ -1436,6 +1579,11 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('mousedown', onDocumentMousedown)
   window.removeEventListener('resize', syncViewport)
+  if (activeVoiceCaptureMode.value === 'local') {
+    localStreamGeneration += 1
+    localPcmRecorder.cancel()
+    void cancelActiveLocalStreamCapture()
+  }
 })
 
 function removeAttachment(id: string) {
@@ -1554,6 +1702,7 @@ function isImage(type: string): boolean {
         ref="textareaRef"
         v-model="inputText"
         class="input-textarea"
+        dir="auto"
         :style="textareaHeight ? { height: textareaHeight + 'px' } : {}"
         :placeholder="t('chat.inputPlaceholder')"
         rows="1"
@@ -1956,7 +2105,7 @@ function isImage(type: string): boolean {
   align-items: center;
   gap: 5px;
   padding: 0 0 0 2px;
-  margin-left: 0;
+  margin-inline-start: 0;
 
   .switch-label {
     display: flex;
@@ -1974,7 +2123,7 @@ function isImage(type: string): boolean {
 
   :deep(.n-switch),
   :deep(.n-switch__rail) {
-    margin-right: 0;
+    margin-inline-end: 0;
   }
 }
 
@@ -1986,7 +2135,7 @@ function isImage(type: string): boolean {
   width: 24px;
   min-width: 24px;
   height: 22px;
-  margin-left: 0;
+  margin-inline-start: 0;
   padding: 0;
   background: transparent !important;
   opacity: 1;
@@ -2232,12 +2381,13 @@ function isImage(type: string): boolean {
   min-width: 0;
   max-width: calc(100% - 28px);
   padding: 0;
+  color: $text-muted;
   pointer-events: auto;
 }
 
 .context-info {
   font-size: 11px;
-  color: $text-muted;
+  color: inherit;
   min-width: 0;
   white-space: nowrap;
 
@@ -2262,15 +2412,19 @@ function isImage(type: string): boolean {
 .context-bar {
   width: 60px;
   height: 4px;
-  margin-left: -4px;
-  background: rgba(128, 128, 128, 0.2);
+  margin-inline-start: -4px;
+  background: rgba(var(--text-muted-rgb), 0.2);
   border-radius: 2px;
   overflow: hidden;
 }
 
 .context-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, rgba(128, 128, 128, 0.3), rgba(128, 128, 128, 0.6));
+  background: linear-gradient(
+    90deg,
+    rgba(var(--text-muted-rgb), 0.45),
+    rgba(var(--text-muted-rgb), 0.85)
+  );
   border-radius: 2px;
   transition: width 0.3s ease;
 
@@ -2283,29 +2437,25 @@ function isImage(type: string): boolean {
   }
 }
 
-.dark .context-info {
-  color: rgba(255, 255, 255, 0.68);
-
-  &.context-warning {
-    color: #f0bc58;
-  }
-}
-
 .dark .context-limit-editable {
-  color: rgba(255, 255, 255, 0.8);
+  color: var(--text-secondary);
 
   &:hover {
-    border-bottom-color: rgba(255, 255, 255, 0.58);
-    background: rgba(255, 255, 255, 0.08);
+    border-bottom-color: var(--text-muted);
+    background: rgba(var(--text-muted-rgb), 0.1);
   }
 }
 
 .dark .context-bar {
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(var(--text-muted-rgb), 0.2);
 }
 
 .dark .context-bar-fill {
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.72));
+  background: linear-gradient(
+    90deg,
+    rgba(var(--text-muted-rgb), 0.5),
+    rgba(var(--text-muted-rgb), 0.9)
+  );
 
   &.context-bar-warn {
     background: linear-gradient(90deg, #d99d35, #f0bc58);
@@ -2489,7 +2639,7 @@ function isImage(type: string): boolean {
   width: 100%;
   min-height: 150px;
   background-color: $bg-card;
-  border: 1px solid $border-color;
+  border: 1px solid var(--input-border-color);
   border-radius: 18px;
   padding: 22px 12px 9px;
   position: relative;
@@ -2498,8 +2648,12 @@ function isImage(type: string): boolean {
   transition: border-color $transition-fast, box-shadow $transition-fast;
 
   &:focus-within {
-    border-color: rgba(var(--text-primary-rgb), 0.22);
+    border-color: var(--input-border-focus-color);
     box-shadow: 0 10px 32px rgba(0, 0, 0, 0.11);
+  }
+
+  &:hover:not(:focus-within) {
+    border-color: var(--input-border-hover-color);
   }
 
   &.drag-over {
@@ -2550,7 +2704,8 @@ function isImage(type: string): boolean {
   }
 
   &::placeholder {
-    color: $text-muted;
+    color: var(--input-placeholder-color);
+    opacity: 1;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2834,7 +2989,7 @@ function isImage(type: string): boolean {
   border-radius: $radius-sm;
   background: $bg-secondary;
   color: $text-primary;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   overflow: hidden;
   outline: none;
@@ -2862,7 +3017,7 @@ function isImage(type: string): boolean {
   border: 0;
   background: transparent;
   color: inherit;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   outline: none;
 }

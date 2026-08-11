@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -480,6 +480,124 @@ describe('coding agent launch preparation', () => {
     expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openrouter', 'claude-code'))
   })
 
+  it('writes group prompts only to the current hidden run files and preserves single-chat prompts', async () => {
+    const home = makeHome()
+    const sharedLaunch = {
+      profile: 'default',
+      provider: 'custom_group_prompt',
+      model: 'test-model',
+      baseUrl: 'https://provider.example/v1',
+      apiKey: 'sk-test',
+    }
+    const groupSystemPrompt = [
+      'GROUP_ONLY_DYNAMIC_PROMPT',
+      '当前房间：测试群聊',
+      '## 图片格式',
+    ].join('\n')
+
+    const groupClaude = await prepareCodingAgentLaunch('claude-code', {
+      ...sharedLaunch,
+      sessionId: 'gc-run-claude',
+      agentSessionId: 'gc-agent-claude',
+      groupSystemPrompt,
+      groupRuntimeScope: {
+        roomId: 'room-1',
+        agentId: 'room-agent-claude',
+      },
+    })
+    const singleClaude = await prepareCodingAgentLaunch('claude-code', {
+      ...sharedLaunch,
+      sessionId: 'single-run-claude',
+      agentSessionId: 'single-agent-claude',
+    })
+    const groupCodex = await prepareCodingAgentLaunch('codex', {
+      ...sharedLaunch,
+      sessionId: 'gc-run-codex',
+      agentSessionId: 'gc-agent-codex',
+      groupSystemPrompt,
+      groupRuntimeScope: {
+        roomId: 'room-1',
+        agentId: 'room-agent-codex',
+      },
+    })
+    const singleCodex = await prepareCodingAgentLaunch('codex', {
+      ...sharedLaunch,
+      sessionId: 'single-run-codex',
+      agentSessionId: 'single-agent-codex',
+    })
+
+    expect(groupClaude.rootDir).not.toBe(singleClaude.rootDir)
+    expect(groupCodex.rootDir).not.toBe(singleCodex.rootDir)
+    expect(groupClaude.rootDir).toContain(join('custom_group_prompt', 'claude-code', 'group-chat'))
+    expect(groupCodex.rootDir).toContain(join('custom_group_prompt', 'codex', 'group-chat'))
+    expect(groupClaude.rootDir).not.toContain(join('claude-code', 'runs'))
+    expect(groupCodex.rootDir).not.toContain(join('codex', 'runs'))
+
+    const groupClaudePrompt = readFileSync(join(groupClaude.rootDir, 'hermes-rules.md'), 'utf-8')
+    const singleClaudePrompt = readFileSync(join(singleClaude.rootDir, 'hermes-rules.md'), 'utf-8')
+    const groupCodexConfig = readFileSync(join(groupCodex.rootDir, 'config.toml'), 'utf-8')
+    const singleCodexConfig = readFileSync(join(singleCodex.rootDir, 'config.toml'), 'utf-8')
+
+    expect(groupClaudePrompt).toContain(groupSystemPrompt)
+    expect(groupCodexConfig).toContain('GROUP_ONLY_DYNAMIC_PROMPT')
+    expect(singleClaudePrompt).toContain('# 输出格式规范')
+    expect(singleCodexConfig).toContain('# 输出格式规范')
+    expect(singleClaudePrompt).not.toContain('GROUP_ONLY_DYNAMIC_PROMPT')
+    expect(singleCodexConfig).not.toContain('GROUP_ONLY_DYNAMIC_PROMPT')
+
+    expect(groupClaude.args).toContain('--append-system-prompt-file')
+    expect(groupClaude.args).not.toContain('--append-system-prompt')
+    expect(groupClaude.args.join(' ')).not.toContain('GROUP_ONLY_DYNAMIC_PROMPT')
+    expect(groupCodex.args.join(' ')).not.toContain('developer_instructions=')
+    expect(groupCodex.args.join(' ')).not.toContain('GROUP_ONLY_DYNAMIC_PROMPT')
+
+    const updatedGroupPrompt = `${groupSystemPrompt}\nUPDATED_SAME_FILE`
+    const nextGroupClaude = await prepareCodingAgentLaunch('claude-code', {
+      ...sharedLaunch,
+      sessionId: 'gc-run-claude-next',
+      agentSessionId: 'gc-agent-claude-next',
+      groupSystemPrompt: updatedGroupPrompt,
+      groupRuntimeScope: {
+        roomId: 'room-1',
+        agentId: 'room-agent-claude',
+      },
+    })
+    const nextGroupCodex = await prepareCodingAgentLaunch('codex', {
+      ...sharedLaunch,
+      sessionId: 'gc-run-codex-next',
+      agentSessionId: 'gc-agent-codex-next',
+      groupSystemPrompt: updatedGroupPrompt,
+      groupRuntimeScope: {
+        roomId: 'room-1',
+        agentId: 'room-agent-codex',
+      },
+    })
+
+    expect(nextGroupClaude.rootDir).toBe(groupClaude.rootDir)
+    expect(nextGroupCodex.rootDir).toBe(groupCodex.rootDir)
+    expect(readFileSync(join(nextGroupClaude.rootDir, 'hermes-rules.md'), 'utf-8')).toContain('UPDATED_SAME_FILE')
+    expect(readFileSync(join(nextGroupCodex.rootDir, 'config.toml'), 'utf-8')).toContain('UPDATED_SAME_FILE')
+
+    expect(existsSync(join(
+      home,
+      'coding-agent',
+      'model',
+      'default',
+      'custom_group_prompt',
+      'claude-code',
+      'hermes-rules.md',
+    ))).toBe(false)
+    expect(existsSync(join(
+      home,
+      'coding-agent',
+      'model',
+      'default',
+      'custom_group_prompt',
+      'codex',
+      'config.toml',
+    ))).toBe(false)
+  })
+
   it('uses Claude Code auto permission mode for scoped root launches', async () => {
     mockProcessUid(0)
     const home = makeHome()
@@ -764,7 +882,7 @@ describe('coding agent launch preparation', () => {
     expect(config).toContain(`base_url = "http://127.0.0.1:8648/api/codex-proxy/`)
     expect(config).toMatch(/experimental_bearer_token = "hwui_[^"]+"/)
     expect(config).not.toContain('base_url = "https://api.openai.com/v1"')
-    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openai-api', 'codex'))
+    expect(dirname(dirname(result.rootDir))).toBe(join(home, 'coding-agent', 'model', 'default', 'openai-api', 'codex'))
   })
 
   it('points Codex Anthropic Messages providers at the local Responses proxy', async () => {
@@ -1299,6 +1417,98 @@ describe('coding agent launch preparation', () => {
     expect(sse).toContain('event: message_stop')
   })
 
+  it('returns one normalized Claude tool call when Responses uses separate item and call ids', async () => {
+    const target = registerClaudeCodeProxyTarget({
+      provider: 'fun-codex',
+      model: 'gpt-5.5',
+      baseUrl: 'https://api.apikey.fun/v1',
+      apiKey: 'sk-upstream',
+      apiMode: 'codex_responses',
+    })
+    const fullArguments = JSON.stringify({
+      file_path: '/tmp/package.json',
+      pages: '',
+    })
+    const encoder = new TextEncoder()
+    const frames = [
+      { type: 'response.created', response: { id: 'resp_read', status: 'in_progress' } },
+      {
+        type: 'response.output_item.added',
+        output_index: 0,
+        item: {
+          type: 'function_call',
+          id: 'fc_read',
+          call_id: 'call_read',
+          name: 'Read',
+          arguments: '',
+          status: 'in_progress',
+        },
+      },
+      {
+        type: 'response.function_call_arguments.delta',
+        output_index: 0,
+        item_id: 'fc_read',
+        delta: fullArguments,
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          type: 'function_call',
+          id: 'fc_read',
+          call_id: 'call_read',
+          name: 'Read',
+          arguments: fullArguments,
+          status: 'completed',
+        },
+      },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp_read',
+          status: 'completed',
+          usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+        },
+      },
+    ]
+    const fetchMock = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        for (const frame of frames) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`))
+        }
+        controller.close()
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const ctx = makeProxyContext(target.routeKey, target.token, {
+      stream: true,
+      messages: [{ role: 'user', content: 'read package.json' }],
+      tools: [{
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            pages: { type: 'string' },
+          },
+          required: ['file_path'],
+        },
+      }],
+    })
+
+    await claudeProxyMessages(ctx)
+
+    const chunks: string[] = []
+    for await (const chunk of ctx.body) chunks.push(String(chunk))
+    const sse = chunks.join('')
+    expect(sse.match(/"type":"tool_use"/g)).toHaveLength(1)
+    expect(sse).toContain('"id":"call_read","name":"Read"')
+    expect(sse).toContain('partial_json":"{\\"file_path\\":\\"/tmp/package.json\\"}"')
+    expect(sse).not.toContain('"name":"tool"')
+    expect(sse).not.toContain('pages')
+  })
+
   it('round-trips reasoning_content for DeepSeek-style OpenAI Chat tool calls', async () => {
     const target = registerClaudeCodeProxyTarget({
       provider: 'deepseek',
@@ -1451,6 +1661,40 @@ describe('coding agent launch preparation', () => {
 
     expect(first.routeKey).not.toBe(second.routeKey)
     expect(first.token).not.toBe(second.token)
+  })
+
+  it('keeps hidden session runtime configs separate for the same agent, provider, and model', async () => {
+    makeHome()
+    const common = {
+      profile: 'default',
+      provider: 'same-provider',
+      model: 'same-model',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-upstream',
+      apiMode: 'codex_responses' as const,
+      isolateSettings: true,
+    }
+    const first = await prepareCodingAgentLaunch('claude-code', {
+      ...common,
+      sessionId: 'chat-one',
+      agentSessionId: 'agent-one',
+    })
+    const second = await prepareCodingAgentLaunch('claude-code', {
+      ...common,
+      sessionId: 'chat-two',
+      agentSessionId: 'agent-two',
+    })
+
+    expect(first.rootDir).not.toBe(second.rootDir)
+    const firstSettings = JSON.parse(readFileSync(join(first.rootDir, 'settings.json'), 'utf-8'))
+    const secondSettings = JSON.parse(readFileSync(join(second.rootDir, 'settings.json'), 'utf-8'))
+    const decodeTarget = (baseUrl: string) => JSON.parse(Buffer.from(
+      new URL(baseUrl).pathname.split('/').filter(Boolean).at(-1) || '',
+      'base64url',
+    ).toString('utf-8'))
+
+    expect(decodeTarget(firstSettings.env.ANTHROPIC_BASE_URL).slice(-2)).toEqual(['agent-one', 'chat-one'])
+    expect(decodeTarget(secondSettings.env.ANTHROPIC_BASE_URL).slice(-2)).toEqual(['agent-two', 'chat-two'])
   })
 
   it('keeps Codex proxy routes separate for the same model with different upstream URLs', () => {

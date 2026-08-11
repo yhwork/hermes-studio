@@ -1,8 +1,16 @@
 import Koa from 'koa'
 import bodyParser from '@koa/bodyparser'
 import { createServer, type Server as HttpServer } from 'http'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { groupChatRoutes, setGroupChatServer } from '../../packages/server/src/routes/hermes/group-chat'
+import { groupChatPublicRoutes, groupChatRoutes, setGroupChatServer } from '../../packages/server/src/routes/hermes/group-chat'
+import {
+  issueRemoteWorkspaceGrant,
+  resetRemoteWorkspaceGrantsForTest,
+  revokeRemoteWorkspaceGrantsForRun,
+} from '../../packages/server/src/services/hermes/group-chat/remote-workspace-auth'
 
 function listen(server: HttpServer): Promise<string> {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
@@ -18,6 +26,13 @@ describe('group chat REST route baseline', () => {
   let storage: any
   let agentClients: any
   let clearRoomRuntimeState: ReturnType<typeof vi.fn>
+  let updateRoomName: ReturnType<typeof vi.fn>
+  let broadcastRoomMetadata: ReturnType<typeof vi.fn>
+  let broadcastRoomAgents: ReturnType<typeof vi.fn>
+  let removeLiveRoomMember: ReturnType<typeof vi.fn>
+  let publishAgentAttachmentMessage: ReturnType<typeof vi.fn>
+  let roomSummaryService: any
+  const temporaryDirectories: string[] = []
 
   beforeEach(async () => {
     storage = {
@@ -29,20 +44,56 @@ describe('group chat REST route baseline', () => {
       getRoom: vi.fn((id) => storage.rooms.get(id)),
       getAllRooms: vi.fn(() => [...storage.rooms.values()]),
       getRoomsForProfiles: vi.fn(() => [...storage.rooms.values()]),
+      getRoomsForAuthUser: vi.fn(() => []),
+      getOwnedRoomsForAuthUser: vi.fn(() => []),
       getRecentMessagesForUI: vi.fn((roomId, limit = 150, offset = 0) => (storage.messages.get(roomId) || []).slice(offset, offset + limit)),
       getMessageCount: vi.fn((roomId) => (storage.messages.get(roomId) || []).length),
+      getMessage: vi.fn((messageId) => [...storage.messages.values()].flat().find((message: any) => message.id === messageId) || null),
       getRoomAgents: vi.fn((roomId) => storage.agents.get(roomId) || []),
       getRoomMembers: vi.fn((roomId) => storage.members.get(roomId) || []),
+      getMemberByUserId: vi.fn((roomId, userId) => (storage.members.get(roomId) || []).find((member: any) => member.userId === userId) || null),
+      removeRoomMember: vi.fn((roomId, userId) => storage.members.set(
+        roomId,
+        (storage.members.get(roomId) || []).filter((member: any) => member.userId !== userId),
+      )),
       getRoomByInviteCode: vi.fn((code) => [...storage.rooms.values()].find((r: any) => r.inviteCode === code)),
-      addRoomAgent: vi.fn((roomId, agentId, profile, name, description, invited) => {
-        const row = { id: `row-${agentId}`, roomId, agentId, profile, name, description, invited }
+      addRoomAgent: vi.fn((roomId, agentId, profile, name, description, invited, metadata = {}) => {
+        const row = { id: `row-${agentId}`, roomId, agentId, profile, name, description, invited, ...metadata }
         storage.agents.set(roomId, [...(storage.agents.get(roomId) || []), row])
         return row
       }),
       getRoomAgent: vi.fn((roomId, ref) => (storage.agents.get(roomId) || []).find((a: any) => a.id === ref || a.agentId === ref) || null),
+      updateRoomAgent: vi.fn((roomId, ref, profile, name, description, metadata = {}) => {
+        const rows = storage.agents.get(roomId) || []
+        const row = rows.find((agent: any) => agent.id === ref || agent.agentId === ref)
+        if (!row) return null
+        Object.assign(row, { profile, name, description, ...metadata })
+        return row
+      }),
       removeRoomMembersForAgent: vi.fn(),
       removeRoomAgent: vi.fn((roomId, ref) => storage.agents.set(roomId, (storage.agents.get(roomId) || []).filter((a: any) => a.id !== ref && a.agentId !== ref))),
       clearRoomContext: vi.fn((roomId) => { const room = storage.rooms.get(roomId); if (room) Object.assign(room, { totalTokens: 0, sessionSeed: 'rotated' }) }),
+      updateRoomConfig: vi.fn((roomId, config) => {
+        const room = storage.rooms.get(roomId)
+        if (room) Object.assign(room, config)
+        return room
+      }),
+      updateRoomInviteCode: vi.fn((roomId, inviteCode) => {
+        const room = storage.rooms.get(roomId)
+        if (room) room.inviteCode = inviteCode
+      }),
+      updateRoomGuestAgentPolicy: vi.fn((roomId, policy) => {
+        const room = storage.rooms.get(roomId)
+        if (room) {
+          Object.assign(room, {
+            allowGuestAgents: policy.allowGuestAgents ? 1 : 0,
+            guestAgentApproval: 'owner',
+            maxGuestAgentsPerMember: policy.maxGuestAgentsPerMember,
+            allowRemoteWorkspaceAccess: policy.allowGuestAgents && policy.allowRemoteWorkspaceAccess ? 1 : 0,
+          })
+        }
+        return room || null
+      }),
       deleteRoom: vi.fn((roomId) => storage.rooms.delete(roomId)),
     }
     agentClients = {
@@ -55,17 +106,78 @@ describe('group chat REST route baseline', () => {
       disconnectRoom: vi.fn(),
     }
     clearRoomRuntimeState = vi.fn()
-    setGroupChatServer({ getStorage: () => storage, agentClients, clearRoomRuntimeState } as any)
+    updateRoomName = vi.fn((roomId: string, name: string) => {
+      const room = storage.rooms.get(roomId)
+      if (room) room.name = name
+      return room || null
+    })
+    broadcastRoomMetadata = vi.fn((roomId: string) => storage.getRoom(roomId) || null)
+    broadcastRoomAgents = vi.fn((roomId: string) => storage.getRoomAgents(roomId))
+    removeLiveRoomMember = vi.fn((roomId: string, userId: string) => {
+      storage.removeRoomMember(roomId, userId)
+      return storage.getRoomMembers(roomId)
+    })
+    publishAgentAttachmentMessage = vi.fn(() => ({ id: 'agent-attachment-message-1' }))
+    roomSummaryService = {
+      runExclusive: vi.fn(async (_roomId: string, task: () => unknown) => task()),
+      getState: vi.fn((roomId: string) => ({
+        roomId,
+        summary: '',
+        summaryThroughMessageId: '',
+        summaryThroughMessageTimestamp: 0,
+        summarizedTurnCount: 0,
+        status: 'idle',
+        version: 0,
+        updatedAt: 0,
+        lastError: null,
+      })),
+      updateSummaryText: vi.fn(async (roomId: string, summary: string) => ({
+        roomId,
+        summary,
+        summaryThroughMessageId: '',
+        summaryThroughMessageTimestamp: 0,
+        summarizedTurnCount: 0,
+        status: 'success',
+        version: 1,
+        updatedAt: 10,
+        lastError: null,
+      })),
+    }
+    setGroupChatServer({
+      getStorage: () => storage,
+      getRoomSummaryService: () => roomSummaryService,
+      agentClients,
+      clearRoomRuntimeState,
+      updateRoomName,
+      broadcastRoomMetadata,
+      broadcastRoomAgents,
+      broadcastGuestAgentPolicy: vi.fn(),
+      removeRoomMember: removeLiveRoomMember,
+      publishAgentAttachmentMessage,
+      getRoomAgentViews: (roomId: string) => storage.getRoomAgents(roomId),
+      ensureDefaultRoomWorkspace: (roomId: string, profile: string) => `/managed/group-chat/${profile}/${roomId}`,
+    } as any)
     const app = new Koa()
     app.use(bodyParser())
+    app.use(async (ctx, next) => {
+      const userId = Number(ctx.get('x-test-user-id') || 0)
+      if (userId > 0) ctx.state.user = { id: userId, role: 'user', profiles: [] }
+      if (ctx.get('x-test-user') === 'member') {
+        ctx.state.user = { id: 7, username: 'member', role: 'user', profiles: ['default'] }
+      }
+      await next()
+    })
+    app.use(groupChatPublicRoutes.routes())
     app.use(groupChatRoutes.routes())
     httpServer = createServer(app.callback())
     baseUrl = await listen(httpServer)
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     httpServer.close()
     setGroupChatServer(null as any)
+    resetRemoteWorkspaceGrantsForTest()
+    await Promise.all(temporaryDirectories.splice(0).map(path => rm(path, { recursive: true, force: true })))
   })
 
   it('requires name and inviteCode when creating a room', async () => {
@@ -77,6 +189,265 @@ describe('group chat REST route baseline', () => {
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: 'name and inviteCode are required' })
+  })
+
+  it('resolves invite-only room metadata without exposing management fields', async () => {
+    storage.rooms.set('room-1', {
+      id: 'room-1',
+      name: 'Shared Room',
+      inviteCode: 'ROOM1',
+      workspace: '/private/workspace',
+      summaryProfile: 'default',
+    })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/join/ROOM1`)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({
+      room: {
+        id: 'room-1',
+        name: 'Shared Room',
+        inviteCode: null,
+        canManage: false,
+        canMentionAll: false,
+        ownerMemberId: '',
+        summaryProfile: '',
+        summaryProvider: '',
+        summaryModel: '',
+        summaryApiMode: '',
+        summaryEveryTurns: 0,
+        totalTokens: 0,
+        workspace: '',
+        allowGuestAgents: 0,
+        guestAgentApproval: 'owner',
+        maxGuestAgentsPerMember: 1,
+      },
+    })
+  })
+
+  it('updates guest Agent policy without returning internal room ownership fields', async () => {
+    storage.rooms.set('room-1', {
+      id: 'room-1',
+      name: 'Owner Room',
+      ownerAuthUserId: 7,
+      inviteCode: 'SECRET',
+      workspace: '/private/workspace',
+      allowGuestAgents: 0,
+      guestAgentApproval: 'owner',
+      maxGuestAgentsPerMember: 1,
+    })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/guest-agent-policy`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-test-user-id': '7',
+      },
+      body: JSON.stringify({
+        allowGuestAgents: true,
+        maxGuestAgentsPerMember: 2,
+        allowRemoteWorkspaceAccess: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({
+      policy: {
+        allowGuestAgents: 1,
+        guestAgentApproval: 'owner',
+        maxGuestAgentsPerMember: 2,
+        allowRemoteWorkspaceAccess: 1,
+      },
+    })
+  })
+
+  it('rotates the invite code without removing existing remote Agents', async () => {
+    const remoteAgent = {
+      id: 'remote-row',
+      roomId: 'room-1',
+      agentId: 'remote-agent',
+      name: 'Remote Agent',
+      executorType: 'remote',
+      connectorId: 'connector-1',
+    }
+    storage.rooms.set('room-1', {
+      id: 'room-1',
+      name: 'Owner Room',
+      ownerAuthUserId: 7,
+      inviteCode: 'OLD-CODE',
+    })
+    storage.agents.set('room-1', [remoteAgent])
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/invite-code`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-test-user-id': '7',
+      },
+      body: JSON.stringify({ inviteCode: 'NEW-CODE' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(storage.updateRoomInviteCode).toHaveBeenCalledWith('room-1', 'NEW-CODE')
+    expect(broadcastRoomMetadata).toHaveBeenCalledWith('room-1')
+    expect(storage.getRoomAgents('room-1')).toEqual([remoteAgent])
+    expect(storage.removeRoomAgent).not.toHaveBeenCalled()
+    expect(agentClients.removeAgentFromRoom).not.toHaveBeenCalled()
+  })
+
+  it('generates a fresh invite code when cloning a room', async () => {
+    storage.rooms.set('room-source', {
+      id: 'room-source',
+      name: 'Source Room',
+      inviteCode: 'SOURCE-CODE',
+      summaryProfile: 'default',
+      summaryProvider: 'openai',
+      summaryModel: 'summary-model',
+      summaryApiMode: 'chat_completions',
+      summaryEveryTurns: 20,
+      workspace: '',
+    })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-source/clone`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Cloned Room' }),
+    })
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(body.room).toMatchObject({ name: 'Cloned Room' })
+    expect(body.room.inviteCode).toMatch(/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{16}$/)
+    expect(body.room.inviteCode).not.toBe('SOURCE-CODE')
+  })
+
+  it('serves the remote workspace API only with an active run-bound grant', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'group-chat-remote-route-'))
+    temporaryDirectories.push(workspace)
+    await writeFile(join(workspace, 'shared.txt'), 'shared content')
+    storage.rooms.set('room-remote', {
+      id: 'room-remote',
+      name: 'Remote Room',
+      workspace,
+      allowRemoteWorkspaceAccess: 1,
+    })
+    const { token } = issueRemoteWorkspaceGrant({
+      runId: 'run-route',
+      roomId: 'room-remote',
+      agentId: 'agent-route',
+      workspace,
+    })
+    const endpoint = `${baseUrl}/api/hermes/group-chat/remote-workspace/v1`
+
+    const unauthorized = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'read', path: 'shared.txt' }),
+    })
+    expect(unauthorized.status).toBe(401)
+
+    const authorized = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'read', path: 'shared.txt' }),
+    })
+    expect(authorized.status).toBe(200)
+    await expect(authorized.json()).resolves.toMatchObject({
+      ok: true,
+      path: 'shared.txt',
+      content: 'shared content',
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+
+    const binary = Buffer.from([0x00, 0xff, 0x10, 0x20])
+    const upload = await fetch(`${endpoint}/file?path=${encodeURIComponent('artifacts/data.bin')}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/octet-stream',
+      },
+      body: binary,
+    })
+    expect(upload.status).toBe(200)
+    const uploaded = await upload.json() as { sha256: string; messageId: string }
+    expect(uploaded.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(uploaded.messageId).toBe('agent-attachment-message-1')
+    expect(publishAgentAttachmentMessage).toHaveBeenCalledWith(expect.objectContaining({
+      roomId: 'room-remote',
+      agentId: 'agent-route',
+      runId: 'run-route',
+      workspacePath: 'artifacts/data.bin',
+    }))
+
+    const download = await fetch(`${endpoint}/file?path=${encodeURIComponent('artifacts/data.bin')}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(download.status).toBe(200)
+    expect(download.headers.get('x-content-sha256')).toBe(uploaded.sha256)
+    expect(Buffer.from(await download.arrayBuffer())).toEqual(binary)
+
+    const overwriteWithoutHash = await fetch(
+      `${endpoint}/file?path=${encodeURIComponent('artifacts/data.bin')}`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: Buffer.from('replacement'),
+      },
+    )
+    expect(overwriteWithoutHash.status).toBe(409)
+    await expect(overwriteWithoutHash.json()).resolves.toMatchObject({ code: 'workspace_conflict' })
+
+    const replacement = Buffer.from([0x11, 0x22])
+    const overwrite = await fetch(`${endpoint}/file?path=${encodeURIComponent('artifacts/data.bin')}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/octet-stream',
+        'X-Expected-SHA256': uploaded.sha256,
+      },
+      body: replacement,
+    })
+    expect(overwrite.status).toBe(200)
+    expect(await readFile(join(workspace, 'artifacts/data.bin'))).toEqual(replacement)
+
+    revokeRemoteWorkspaceGrantsForRun('run-route')
+    const revoked = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'list', path: '' }),
+    })
+    expect(revoked.status).toBe(401)
+  })
+
+  it('returns public lastActiveAt and keeps the aggregated authenticated room list ordered by activity instead of room id', async () => {
+    storage.getRoomsForProfiles.mockReturnValue([
+      { id: 'room-old-active', name: 'Old but active', inviteCode: 'Z', createdAt: 100, lastActiveAt: 300 },
+    ])
+    storage.getRoomsForAuthUser.mockReturnValue([
+      { id: 'room-new-created', name: 'New but inactive', inviteCode: 'A', createdAt: 200, lastActiveAt: 200 },
+    ])
+    storage.getOwnedRoomsForAuthUser.mockReturnValue([])
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms`, {
+      headers: { 'x-test-user': 'member' },
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      rooms: [
+        { id: 'room-old-active', lastActiveAt: 300 },
+        { id: 'room-new-created', lastActiveAt: 200 },
+      ],
+    })
   })
 
   it('rejects reserved @all agent names when creating a room', async () => {
@@ -114,6 +485,146 @@ describe('group chat REST route baseline', () => {
     expect(storage.saveRoom).toHaveBeenCalled()
   })
 
+  it('persists the selected rolling-summary runtime when creating a room', async () => {
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Summary Room',
+        inviteCode: 'SUM123',
+        summary: {
+          profile: 'research',
+          provider: 'openai',
+          model: 'gpt-summary',
+          apiMode: 'codex_responses',
+          everyTurns: 12,
+        },
+        agents: [],
+      }),
+    })
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(storage.saveRoom).toHaveBeenCalledWith(
+      expect.any(String),
+      'Summary Room',
+      'SUM123',
+      expect.objectContaining({
+        summaryProfile: 'research',
+        summaryProvider: 'openai',
+        summaryModel: 'gpt-summary',
+        summaryApiMode: 'codex_responses',
+        summaryEveryTurns: 12,
+      }),
+    )
+    expect(body.room).toMatchObject({
+      summaryProfile: 'research',
+      summaryProvider: 'openai',
+      summaryModel: 'gpt-summary',
+      summaryApiMode: 'codex_responses',
+      summaryEveryTurns: 12,
+    })
+  })
+
+  it('updates summary config, reads its anchor, and manually edits its text', async () => {
+    storage.rooms.set('room-1', {
+      id: 'room-1',
+      name: 'Room',
+      inviteCode: 'ROOM1',
+      summaryProfile: 'default',
+      summaryProvider: 'openai',
+      summaryModel: 'old-model',
+      summaryApiMode: 'chat_completions',
+      summaryEveryTurns: 20,
+    })
+    storage.messages.set('room-1', [{
+      id: 'anchor-1',
+      timestamp: 5,
+      senderName: 'Agent',
+      role: 'assistant',
+      content: 'Anchor content',
+    }])
+    roomSummaryService.getState.mockReturnValue({
+      roomId: 'room-1',
+      summary: 'Current summary',
+      summaryThroughMessageId: 'anchor-1',
+      summaryThroughMessageTimestamp: 5,
+      summarizedTurnCount: 10,
+      status: 'success',
+      version: 2,
+      updatedAt: 6,
+      lastError: null,
+    })
+
+    const configRes = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Renamed Room',
+        summaryProfile: 'research',
+        summaryProvider: 'anthropic',
+        summaryModel: 'claude-test',
+        summaryApiMode: 'anthropic_messages',
+        summaryEveryTurns: 8,
+      }),
+    })
+    expect(configRes.status).toBe(200)
+    expect(updateRoomName).toHaveBeenCalledWith('room-1', 'Renamed Room')
+    expect(storage.updateRoomConfig).toHaveBeenCalledWith('room-1', {
+      summaryProfile: 'research',
+      summaryProvider: 'anthropic',
+      summaryModel: 'claude-test',
+      summaryApiMode: 'anthropic_messages',
+      summaryEveryTurns: 8,
+    })
+    await expect(configRes.json()).resolves.toMatchObject({
+      room: { id: 'room-1', name: 'Renamed Room' },
+    })
+
+    const getRes = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/summary`)
+    await expect(getRes.json()).resolves.toMatchObject({
+      summary: {
+        summary: 'Current summary',
+        summaryThroughMessageId: 'anchor-1',
+      },
+      anchor: {
+        id: 'anchor-1',
+        content: 'Anchor content',
+      },
+    })
+
+    const editRes = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/summary`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary: 'Manually corrected summary' }),
+    })
+    expect(editRes.status).toBe(200)
+    expect(roomSummaryService.updateSummaryText).toHaveBeenCalledWith('room-1', 'Manually corrected summary')
+  })
+
+  it('renames a legacy room without requiring summary runtime fields', async () => {
+    storage.rooms.set('room-legacy', {
+      id: 'room-legacy',
+      name: 'Legacy Room',
+      inviteCode: 'LEGACY',
+      summaryProvider: '',
+      summaryModel: '',
+    })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-legacy/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Renamed Legacy Room' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(updateRoomName).toHaveBeenCalledWith('room-legacy', 'Renamed Legacy Room')
+    expect(storage.updateRoomConfig).not.toHaveBeenCalled()
+    await expect(res.json()).resolves.toMatchObject({
+      room: { id: 'room-legacy', name: 'Renamed Legacy Room' },
+    })
+  })
+
   it('returns room detail with paging metadata, agents, and members', async () => {
     storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
     storage.messages.set('room-1', [{ id: 'msg-1' }, { id: 'msg-2' }])
@@ -136,18 +647,292 @@ describe('group chat REST route baseline', () => {
     })
   })
 
-  it('rejects duplicate room agent profiles', async () => {
+  it('allows multiple room agents backed by the same profile', async () => {
     storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
     storage.agents.set('room-1', [{ id: 'row-agent', agentId: 'agent-1', profile: 'default', name: 'Agent' }])
 
     const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profile: 'default', name: 'Agent' }),
+      body: JSON.stringify({ profile: 'default', name: 'Second Agent' }),
     })
 
-    expect(res.status).toBe(409)
-    await expect(res.json()).resolves.toEqual({ error: 'Agent already in room' })
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      agent: {
+        profile: 'default',
+        name: 'Second Agent',
+      },
+    })
+    expect(storage.getRoomAgents('room-1')).toHaveLength(2)
+  })
+
+  it('allows only the room owner to remove a member and removes that member remote Agents', async () => {
+    storage.rooms.set('room-1', {
+      id: 'room-1',
+      name: 'Room',
+      inviteCode: 'ROOM1',
+      ownerAuthUserId: 1,
+    })
+    storage.members.set('room-1', [
+      { id: 'owner-row', userId: 'auth:1', name: 'Owner' },
+      { id: 'guest-row', userId: 'guest-1', name: 'Guest' },
+    ])
+    storage.agents.set('room-1', [{
+      id: 'remote-row',
+      agentId: 'remote-agent',
+      profile: 'default',
+      name: 'Remote Agent',
+      executorType: 'remote',
+      ownerMemberId: 'guest-1',
+      connectorId: '',
+    }])
+
+    const denied = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/members/guest-1`, {
+      method: 'DELETE',
+      headers: { 'x-test-user-id': '2' },
+    })
+    expect(denied.status).toBe(403)
+
+    const removed = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/members/guest-1`, {
+      method: 'DELETE',
+      headers: { 'x-test-user-id': '1' },
+    })
+    expect(removed.status).toBe(200)
+    await expect(removed.json()).resolves.toMatchObject({
+      success: true,
+      members: [{ userId: 'auth:1' }],
+      agents: [],
+    })
+    expect(removeLiveRoomMember).toHaveBeenCalledWith('room-1', 'guest-1')
+    expect(storage.removeRoomAgent).toHaveBeenCalledWith('room-1', 'remote-row')
+    expect(agentClients.removeAgentFromRoom).toHaveBeenCalledWith('room-1', 'remote-agent')
+  })
+
+  it('persists the selected provider, model, api mode, and reasoning effort for a room agent', async () => {
+    storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'codex',
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+        apiMode: 'codex_responses',
+        reasoningEffort: 'high',
+        name: 'Researcher',
+        description: 'Finds evidence',
+        avatar: JSON.stringify({ type: 'generated', seed: 'researcher-avatar' }),
+      }),
+    })
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(agentClients.createAgent).toHaveBeenCalledWith(expect.objectContaining({
+      agent: 'codex',
+      profile: 'research',
+      provider: 'openai',
+      model: 'gpt-test',
+      apiMode: 'codex_responses',
+      reasoningEffort: 'high',
+      name: 'Researcher',
+      description: 'Finds evidence',
+    }))
+    expect(storage.addRoomAgent).toHaveBeenCalledWith(
+      'room-1',
+      expect.any(String),
+      'research',
+      'Researcher',
+      'Finds evidence',
+      0,
+      {
+        agent: 'codex',
+        provider: 'openai',
+        model: 'gpt-test',
+        apiMode: 'codex_responses',
+        reasoningEffort: 'high',
+        avatar: JSON.stringify({ type: 'generated', seed: 'researcher-avatar' }),
+      },
+    )
+    expect(body.agent).toMatchObject({
+      agent: 'codex',
+      profile: 'research',
+      provider: 'openai',
+      model: 'gpt-test',
+      apiMode: 'codex_responses',
+      reasoningEffort: 'high',
+      avatar: JSON.stringify({ type: 'generated', seed: 'researcher-avatar' }),
+    })
+    expect(broadcastRoomAgents).toHaveBeenCalledWith('room-1')
+  })
+
+  it('rejects incomplete or invalid room agent runtime configuration', async () => {
+    storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
+
+    const missingModel = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: 'research', provider: 'openai' }),
+    })
+    expect(missingModel.status).toBe(400)
+
+    const invalidReasoning = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+        reasoningEffort: 'extreme',
+      }),
+    })
+    expect(invalidReasoning.status).toBe(400)
+
+    const missingApiMode = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'codex',
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+      }),
+    })
+    expect(missingApiMode.status).toBe(400)
+
+    const invalidApiMode = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'ekko',
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+        apiMode: 'unsupported',
+      }),
+    })
+    expect(invalidApiMode.status).toBe(400)
+
+    const invalidAgent = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'unknown',
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+      }),
+    })
+    expect(invalidAgent.status).toBe(400)
+
+    const invalidAvatar = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+        avatar: JSON.stringify({ type: 'image', dataUrl: 'javascript:alert(1)' }),
+      }),
+    })
+    expect(invalidAvatar.status).toBe(400)
+    expect(agentClients.createAgent).not.toHaveBeenCalled()
+  })
+
+  it('ignores apiMode for Hermes room agents', async () => {
+    storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'hermes',
+        profile: 'research',
+        provider: 'openai',
+        model: 'gpt-test',
+        apiMode: 'anthropic_messages',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(agentClients.createAgent).toHaveBeenCalledWith(expect.objectContaining({
+      agent: 'hermes',
+      apiMode: '',
+    }))
+    expect(storage.addRoomAgent.mock.calls.at(-1)?.[6]).toMatchObject({
+      agent: 'hermes',
+      apiMode: '',
+    })
+  })
+
+  it('updates a room agent while preserving its identity and replacing its group runtime', async () => {
+    storage.rooms.set('room-1', { id: 'room-1', name: 'Room', inviteCode: 'ROOM1' })
+    storage.agents.set('room-1', [{
+      id: 'row-agent',
+      roomId: 'room-1',
+      agentId: 'agent-1',
+      agent: 'hermes',
+      profile: 'default',
+      provider: 'openai',
+      model: 'old-model',
+      apiMode: '',
+      reasoningEffort: '',
+      name: 'Worker',
+      description: '',
+      invited: 0,
+    }])
+
+    const res = await fetch(`${baseUrl}/api/hermes/group-chat/rooms/room-1/agents/row-agent`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'codex',
+        profile: 'research',
+        provider: 'openai',
+        model: 'new-model',
+        apiMode: 'codex_responses',
+        reasoningEffort: 'high',
+        name: 'Reviewer',
+        description: 'Reviews changes',
+      }),
+    })
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(agentClients.createAgent).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'agent-1',
+      agent: 'codex',
+      profile: 'research',
+      model: 'new-model',
+      apiMode: 'codex_responses',
+      reasoningEffort: 'high',
+      name: 'Reviewer',
+    }))
+    expect(agentClients.removeAgentFromRoom).toHaveBeenCalledWith('room-1', 'agent-1')
+    expect(agentClients.addAgentToRoom).toHaveBeenCalled()
+    expect(storage.updateRoomAgent).toHaveBeenCalledWith(
+      'room-1',
+      'row-agent',
+      'research',
+      'Reviewer',
+      'Reviews changes',
+      {
+        agent: 'codex',
+        provider: 'openai',
+        model: 'new-model',
+        apiMode: 'codex_responses',
+        reasoningEffort: 'high',
+      },
+    )
+    expect(body.agent).toMatchObject({
+      id: 'row-agent',
+      agentId: 'agent-1',
+      profile: 'research',
+      name: 'Reviewer',
+    })
+    expect(broadcastRoomAgents).toHaveBeenCalledWith('room-1')
   })
 
   it('removes an agent by row id and disconnects runtime by persisted agent id', async () => {
@@ -162,6 +947,7 @@ describe('group chat REST route baseline', () => {
     expect(storage.removeRoomAgent).toHaveBeenCalledWith('room-1', 'row-agent')
     expect(agentClients.removeAgentFromRoom).toHaveBeenCalledWith('room-1', 'agent-1')
     expect(body).toMatchObject({ success: true, agents: [], members: [] })
+    expect(broadcastRoomAgents).toHaveBeenCalledWith('room-1')
   })
 
   it('clears room context and runtime state while returning the updated room', async () => {

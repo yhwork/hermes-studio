@@ -12,6 +12,11 @@ import { transcodeToPcmS16le } from '../hermes/stt-providers/audio-convert'
 import { decodeMcuImaAdpcm, encodeMcuImaAdpcm } from '../hermes/mcu-adpcm'
 import { MCU_TTS_SAMPLE_RATE, mcuPromptText, mcuPromptUrl } from '../hermes/mcu-prompts'
 import { createMcuSpeechSegmenter, normalizeMcuSpeechText } from './mcu-speech-segmenter'
+import {
+  mcuChatRunFields,
+  normalizeMcuAgentRuntime,
+  type McuAgentRuntime,
+} from './mcu-agent-runtime'
 import type {
   RelayHttpRequest,
   RelayHttpResponse,
@@ -56,6 +61,7 @@ const ALLOWED_CHAT_RUN_CLIENT_EVENTS = new Set([
   'resume',
   'abort',
   'cancel_queued_run',
+  'insert_queued_run',
   'approval.respond',
   'clarify.respond',
 ])
@@ -83,6 +89,7 @@ const CHAT_RUN_SERVER_EVENTS = [
   'session.command',
   'session.title.updated',
   'run.queued',
+  'run.queue_insertion.updated',
   'approval.requested',
   'approval.resolved',
   'clarify.requested',
@@ -154,6 +161,7 @@ interface McuVoiceChatTurnOptions {
   interactionId: string
   transcript: string
   clientId?: string
+  agentRuntime?: McuAgentRuntime
 }
 
 interface McuAudioWaiter {
@@ -173,6 +181,7 @@ type McuSpeechSynthesisResult =
 interface McuVoiceStreamState {
   interactionId: string
   profile: string
+  agentRuntime: McuAgentRuntime
   mimeType: string
   sampleRate: number
   channels: number
@@ -185,6 +194,7 @@ interface McuVoiceStreamState {
 interface PendingMcuInterrupt {
   clientId: string
   profile: string
+  agentRuntime: McuAgentRuntime
   interactionId: string
   timer: ReturnType<typeof setTimeout>
 }
@@ -541,7 +551,8 @@ export class GlobalAgentServer {
   }
 
   startMcuVoiceChatTurn(options: McuVoiceChatTurnOptions): void {
-    const sessionId = this.mcuSessionId(options.clientId, options.profile)
+    const agentRuntime = normalizeMcuAgentRuntime(options.agentRuntime)
+    const sessionId = this.mcuSessionId(options.clientId, options.profile, agentRuntime)
     const primaryQueueId = `mcu_${randomUUID()}`
     this.emitMcuEvent({
       type: 'interaction.status',
@@ -625,7 +636,12 @@ export class GlobalAgentServer {
       const segmentText = normalizeMcuSpeechText(text)
       if (!segmentText) return
       const segmentId = `${options.interactionId}-tts-${++segmentIndex}`
-      this.emitMcuEvent({ type: 'interaction.status', interactionId: options.interactionId, status: 'speaking' }, { clientId: options.clientId })
+      this.emitMcuEvent({
+        type: 'interaction.status',
+        interactionId: options.interactionId,
+        status: 'speaking',
+        text: segmentText,
+      }, { clientId: options.clientId })
       const controller = this.registerMcuTtsAbortController(options.interactionId)
       const audioResult: Promise<McuSpeechSynthesisResult> = this.synthesizeMcuSpeech(
         segmentText,
@@ -705,8 +721,7 @@ export class GlobalAgentServer {
         session_id: sessionId,
         queue_id: primaryQueueId,
         profile: options.profile,
-        source: 'global_agent',
-        session_source: 'global_agent',
+        ...mcuChatRunFields(agentRuntime),
       }
       const interruptedAt = this.recentlyInterruptedMcuSessions.get(sessionId) || 0
       if (Date.now() - interruptedAt < 10_000) {
@@ -741,20 +756,15 @@ export class GlobalAgentServer {
     socket.on('tool.started', (event: Record<string, unknown> = {}) => {
       if (!currentRunPrimary) return
       flushCompletedAssistantMessage()
+      output = ''
       const tool = typeof event.tool === 'string' ? event.tool : typeof event.name === 'string' ? event.name : 'tool'
-      const preview = typeof event.preview === 'string' ? event.preview : undefined
-      this.emitMcuEvent({ type: 'tool.started', interactionId: options.interactionId, tool, preview }, { clientId: options.clientId })
+      this.emitMcuEvent({ type: 'tool.started', interactionId: options.interactionId, tool }, { clientId: options.clientId })
     })
     const handleToolFinished = (event: Record<string, unknown> = {}, failed = false) => {
       if (!currentRunPrimary) return
       const tool = typeof event.tool === 'string' ? event.tool : typeof event.name === 'string' ? event.name : 'tool'
-      const preview = typeof event.preview === 'string' ? event.preview : undefined
-      const error = typeof event.error === 'string'
-        ? event.error
-        : failed
-          ? 'tool.failed'
-          : undefined
-      this.emitMcuEvent({ type: 'tool.completed', interactionId: options.interactionId, tool, preview, error }, { clientId: options.clientId })
+      const error = failed ? 'tool.failed' : undefined
+      this.emitMcuEvent({ type: 'tool.completed', interactionId: options.interactionId, tool, error }, { clientId: options.clientId })
     }
     socket.on('tool.completed', (event: Record<string, unknown> = {}) => handleToolFinished(event))
     socket.on('tool.failed', (event: Record<string, unknown> = {}) => handleToolFinished(event, true))
@@ -870,7 +880,7 @@ export class GlobalAgentServer {
         return
       }
       if (!currentRunAutonomous) {
-        this.emitMcuEvent({ type: 'tool.started', interactionId: options.interactionId, tool: 'approval', preview: choice }, { clientId: options.clientId })
+        this.emitMcuEvent({ type: 'tool.started', interactionId: options.interactionId, tool: 'approval' }, { clientId: options.clientId })
       }
       socket.emit('approval.respond', {
         session_id: sessionId,
@@ -1087,6 +1097,9 @@ export class GlobalAgentServer {
     })
     socket.on('cancel_queued_run', (payload: unknown) => {
       void this.emitFrontendChatEvent(socket, 'cancel_queued_run', payload)
+    })
+    socket.on('insert_queued_run', (payload: unknown) => {
+      void this.emitFrontendChatEvent(socket, 'insert_queued_run', payload)
     })
     socket.on('approval.respond', (payload: unknown) => {
       void this.emitFrontendChatEvent(socket, 'approval.respond', payload)
@@ -1411,7 +1424,7 @@ export class GlobalAgentServer {
     this.emitFrontendBridgeEvent(clientId, this.redactMcuAuthPayload(body))
   }
 
-  private mcuSessionId(clientId: string | undefined, profile: string): string {
+  private mcuSessionId(clientId: string | undefined, profile: string, agentRuntime: McuAgentRuntime): string {
     const instance = (clientId || 'device')
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, '-')
@@ -1422,7 +1435,7 @@ export class GlobalAgentServer {
       .replace(/[^a-z0-9_-]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 64) || 'default'
-    return `mcu-${instance}-${profileId}`
+    return `mcu-${instance}-${profileId}-${agentRuntime}`
   }
 
   private async synthesizeMcuSpeech(text: string, userToken: string, profile: string, signal?: AbortSignal): Promise<{ url: string; mimeType: string }> {
@@ -1535,7 +1548,7 @@ export class GlobalAgentServer {
       type: 'audio.enqueue',
       interactionId: options.interactionId,
       segmentId,
-      text: '',
+      text,
       url: result.audio.url,
       mimeType: result.audio.mimeType,
       channels: 1,
@@ -1576,14 +1589,14 @@ export class GlobalAgentServer {
     this.mcuSessionRuns.delete(active.sessionId)
   }
 
-  private scheduleMcuInterrupt(clientId: string, profile: string, interactionId: string): void {
-    const sessionId = this.mcuSessionId(clientId, profile)
+  private scheduleMcuInterrupt(clientId: string, profile: string, agentRuntime: McuAgentRuntime, interactionId: string): void {
+    const sessionId = this.mcuSessionId(clientId, profile, agentRuntime)
     this.cancelPendingMcuInterrupt(sessionId)
     const timer = setTimeout(() => {
       this.pendingMcuInterrupts.delete(sessionId)
-      this.interruptMcuSession(clientId, profile, interactionId)
+      this.interruptMcuSession(clientId, profile, agentRuntime, interactionId)
     }, MCU_INTERRUPT_DEBOUNCE_MS)
-    this.pendingMcuInterrupts.set(sessionId, { clientId, profile, interactionId, timer })
+    this.pendingMcuInterrupts.set(sessionId, { clientId, profile, agentRuntime, interactionId, timer })
   }
 
   private cancelPendingMcuInterrupt(sessionId: string): void {
@@ -1622,10 +1635,15 @@ export class GlobalAgentServer {
     }
   }
 
-  private interruptMcuSession(clientId: string, profile: string, interactionId?: string): void {
-    const sessionId = this.mcuSessionId(clientId, profile)
-    const sessionRun = this.mcuSessionRuns.get(sessionId)
+  private interruptMcuSession(clientId: string, profile: string, agentRuntime: McuAgentRuntime, interactionId?: string): void {
     const active = interactionId ? this.activeMcuRuns.get(interactionId) : undefined
+    const requestedSessionId = this.mcuSessionId(clientId, profile, agentRuntime)
+    const activeSessionBelongsToDevice = active && (
+      active.sessionId === this.mcuSessionId(clientId, profile, 'ekko')
+      || active.sessionId === this.mcuSessionId(clientId, profile, 'hermes')
+    )
+    const sessionId = activeSessionBelongsToDevice ? active.sessionId : requestedSessionId
+    const sessionRun = this.mcuSessionRuns.get(sessionId)
     const hasActiveTts = interactionId ? this.mcuTtsAbortControllers.has(interactionId) : false
     if (interactionId && (sessionRun || active || hasActiveTts)) {
       this.interruptedMcuInteractions.add(interactionId)
@@ -1675,8 +1693,8 @@ export class GlobalAgentServer {
     this.mcuTtsAbortControllers.delete(interactionId)
   }
 
-  private clearMcuSession(clientId: string, profile: string, interactionId?: string): void {
-    const sessionId = this.mcuSessionId(clientId, profile)
+  private clearMcuSession(clientId: string, profile: string, agentRuntime: McuAgentRuntime, interactionId?: string): void {
+    const sessionId = this.mcuSessionId(clientId, profile, agentRuntime)
     this.cancelPendingMcuInterrupt(sessionId)
     this.forgetMcuSessionRun(sessionId, interactionId)
     const chatRunServer = getChatRunServer()
@@ -1686,6 +1704,7 @@ export class GlobalAgentServer {
         type: 'mcu.session.cleared',
         interactionId: interactionId || undefined,
         profile,
+        agentRuntime,
         sessionId,
         ok: false,
         error: 'chat_run_server_unavailable',
@@ -1700,6 +1719,7 @@ export class GlobalAgentServer {
       type: 'mcu.session.cleared',
       interactionId: interactionId || undefined,
       profile,
+      agentRuntime,
       sessionId,
       deleted,
       memoryCleared,
@@ -1765,15 +1785,17 @@ export class GlobalAgentServer {
     if (event === 'mcu.interrupt') {
       const interactionId = typeof payload.interactionId === 'string' ? payload.interactionId.trim() : ''
       const profile = typeof payload.profile === 'string' && payload.profile.trim() ? payload.profile.trim() : 'default'
-      this.scheduleMcuInterrupt(clientId, profile, interactionId)
-      this.emitMcuEvent({ type: 'mcu.interrupt.ack', interactionId, profile }, { clientId })
+      const agentRuntime = normalizeMcuAgentRuntime(payload.agentRuntime)
+      this.scheduleMcuInterrupt(clientId, profile, agentRuntime, interactionId)
+      this.emitMcuEvent({ type: 'mcu.interrupt.ack', interactionId, profile, agentRuntime }, { clientId })
       return
     }
 
     if (event === 'mcu.session.clear') {
       const profile = typeof payload.profile === 'string' && payload.profile.trim() ? payload.profile.trim() : 'default'
       const interactionId = typeof payload.interactionId === 'string' ? payload.interactionId.trim() : ''
-      this.clearMcuSession(clientId, profile, interactionId)
+      const agentRuntime = normalizeMcuAgentRuntime(payload.agentRuntime)
+      this.clearMcuSession(clientId, profile, agentRuntime, interactionId)
     }
   }
 
@@ -1787,6 +1809,7 @@ export class GlobalAgentServer {
     this.mcuVoiceStreams.set(clientId, {
       interactionId,
       profile: typeof payload.profile === 'string' && payload.profile.trim() ? payload.profile.trim() : this.frontendProfile(socket) || 'default',
+      agentRuntime: normalizeMcuAgentRuntime(payload.agentRuntime),
       mimeType: typeof payload.mimeType === 'string' && payload.mimeType.trim()
         ? payload.mimeType.trim().toLowerCase()
         : 'audio/pcm',
@@ -2005,6 +2028,7 @@ export class GlobalAgentServer {
           'Content-Type': 'audio/wav',
           'X-Hermes-Mcu-Interaction-Id': stream.interactionId,
           'X-Hermes-Mcu-Device-Id': clientId,
+          'X-Hermes-Mcu-Agent-Runtime': stream.agentRuntime,
           'X-Hermes-Profile': stream.profile,
         },
         body: new Uint8Array(wav),

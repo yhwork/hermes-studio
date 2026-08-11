@@ -6,17 +6,26 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import {
+  EKKO_CONFIG_DIRECTORY_NAME,
+  EKKO_CONFIG_FILE_NAME,
+  serializeDefaultEkkoConfig,
+} from './config'
 
 export interface EkkoDirectoryLayout {
   baseDirectory: string
   rootDirectory: string
   databasePath: string
+  configDirectory: string
+  configPath: string
   skillsDirectory: string
   logsDirectory: string
+  workspaceDirectory: string
 }
 
 export interface EkkoDirectoryInitializationOptions {
@@ -42,26 +51,53 @@ export class EkkoDirectoryManager {
   readonly baseDirectory: string
   readonly rootDirectory: string
   readonly databasePath: string
+  readonly configDirectory: string
+  readonly configPath: string
   readonly skillsDirectory: string
   readonly logsDirectory: string
+  readonly workspaceDirectory: string
   lastSkillImport?: EkkoSkillImportResult
 
   constructor(baseDirectory: string = homedir()) {
     this.baseDirectory = resolve(baseDirectory || homedir())
     this.rootDirectory = join(this.baseDirectory, '.ekko')
     this.databasePath = join(this.rootDirectory, 'ekko.db')
+    this.configDirectory = join(this.rootDirectory, EKKO_CONFIG_DIRECTORY_NAME)
+    this.configPath = join(this.configDirectory, EKKO_CONFIG_FILE_NAME)
     this.skillsDirectory = join(this.rootDirectory, 'skills')
     this.logsDirectory = join(this.rootDirectory, 'logs')
+    this.workspaceDirectory = join(this.rootDirectory, 'workspace')
   }
 
   initialize(options: EkkoDirectoryInitializationOptions = {}): EkkoDirectoryLayout {
     this.lastSkillImport = undefined
+    this.initializeConfigDirectory()
     if (!existsSync(this.skillsDirectory) && options.hermesRootDirectory) {
       this.lastSkillImport = this.importHermesProfileSkills(options.hermesRootDirectory)
     } else {
       mkdirSync(this.skillsDirectory, { recursive: true })
     }
+    mkdirSync(this.workspaceDirectory, { recursive: true })
     return this.layout()
+  }
+
+  /**
+   * Creates the global configuration boundary without overwriting an existing
+   * file. Profile-specific configuration directories are intentionally not
+   * created or loaded yet.
+   */
+  initializeConfigDirectory(): string {
+    mkdirSync(this.configDirectory, { recursive: true, mode: 0o700 })
+    try {
+      writeFileSync(this.configPath, serializeDefaultEkkoConfig(), {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600,
+      })
+    } catch (error) {
+      if (!isErrorWithCode(error, 'EEXIST')) throw error
+    }
+    return this.configPath
   }
 
   profileSkillsDirectory(profile = 'default'): string {
@@ -80,13 +116,32 @@ export class EkkoDirectoryManager {
     return join(this.logsDirectory, profileDirectoryName(profile))
   }
 
+  profileWorkspaceDirectory(profile = 'default'): string {
+    const directory = join(this.workspaceDirectory, profileDirectoryName(profile))
+    mkdirSync(directory, { recursive: true })
+    return directory
+  }
+
+  sessionWorkspaceDirectory(profile: string, sessionId: string): string {
+    const directory = join(
+      this.workspaceDirectory,
+      profileDirectoryName(profile),
+      sessionDirectoryName(sessionId),
+    )
+    mkdirSync(directory, { recursive: true })
+    return directory
+  }
+
   layout(): EkkoDirectoryLayout {
     return {
       baseDirectory: this.baseDirectory,
       rootDirectory: this.rootDirectory,
       databasePath: this.databasePath,
+      configDirectory: this.configDirectory,
+      configPath: this.configPath,
       skillsDirectory: this.skillsDirectory,
       logsDirectory: this.logsDirectory,
+      workspaceDirectory: this.workspaceDirectory,
     }
   }
 
@@ -119,14 +174,24 @@ export class EkkoDirectoryManager {
 
 function profileDirectoryName(value: string): string {
   const profile = String(value || '').trim() || 'default'
+  return safeDirectoryName(profile, 'profile')
+}
+
+function sessionDirectoryName(value: string): string {
+  const sessionId = String(value || '').trim()
+  if (!sessionId) throw new Error('Ekko session directory name is required')
+  return safeDirectoryName(sessionId, 'session')
+}
+
+function safeDirectoryName(value: string, kind: 'profile' | 'session'): string {
   if (
-    profile === '.' ||
-    profile === '..' ||
-    /[<>:"/\\|?*\u0000-\u001f]/u.test(profile)
+    value === '.' ||
+    value === '..' ||
+    /[<>:"/\\|?*\u0000-\u001f]/u.test(value)
   ) {
-    throw new Error(`Invalid Ekko profile directory name: ${profile}`)
+    throw new Error(`Invalid Ekko ${kind} directory name: ${value}`)
   }
-  return profile
+  return value
 }
 
 function hermesProfileSkillSources(
@@ -170,4 +235,8 @@ function isDirectory(path: string): boolean {
   } catch {
     return false
   }
+}
+
+function isErrorWithCode(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && error.code === code
 }

@@ -45,6 +45,11 @@ vi.mock('child_process', () => ({
   }),
 }))
 
+vi.mock('../../packages/server/src/db/hermes/session-store', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../packages/server/src/db/hermes/session-store')>(),
+  updateSessionStats: vi.fn(),
+}))
+
 import { CodingAgentRunManager } from '../../packages/server/src/services/agent-runner/coding-agent-run-manager'
 
 const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
@@ -85,7 +90,15 @@ describe('coding agent Windows process launch', () => {
       state: { messages: [], isWorking: false, events: [], queue: [] },
     })
 
-    manager.send('chat-session-1', 'test', { systemPrompt: 'system prompt\nsecond line' })
+    const groupInput = [
+      '群聊系统：这条消息已经提及你，请直接回复。',
+      '',
+      '以下是群聊记录：',
+      `用户：${'长文本'.repeat(4000)}`,
+      '',
+      '当前消息：检查这个问题',
+    ].join('\n')
+    manager.send('chat-session-1', groupInput, { systemPrompt: 'system prompt\nsecond line' })
 
     expect(testState.spawnCalls[0]).toMatchObject({
       command: 'cmd.exe',
@@ -95,14 +108,17 @@ describe('coding agent Windows process launch', () => {
     expect(testState.spawnCalls[0].args[3]).toContain('^"--settings^"')
     expect(testState.spawnCalls[0].args[3]).toContain('^"--append-system-prompt^"')
     expect(testState.spawnCalls[0].args[3]).toContain('^"system^ prompt^ /^ second^ line^"')
+    expect(testState.spawnCalls[0].args[3]).toContain('^"--input-format^" ^"text^"')
     expect(testState.spawnCalls[0].args[3]).not.toContain('\n')
     expect(testState.spawnCalls[0].args[3]).not.toContain('\r')
-    expect(testState.spawnCalls[0].args[3]).toContain('^"test^"')
+    expect(testState.spawnCalls[0].args[3]).not.toContain('群聊系统')
+    expect(testState.spawnCalls[0].args[3].length).toBeLessThan(8191)
     expect(testState.spawnCalls[0].options).toMatchObject({
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsVerbatimArguments: true,
       windowsHide: true,
     })
+    expect(testState.spawnCalls[0].child.stdin.end).toHaveBeenCalledWith(`${groupInput}\n`)
 
     const run = (manager as any).runs.get('agent-session-1')
     if (run?.idleTimer) clearTimeout(run.idleTimer)
@@ -132,7 +148,15 @@ describe('coding agent Windows process launch', () => {
       state: { messages: [], isWorking: false, events: [], queue: [] },
     })
 
-    manager.send('chat-session-codex-1', 'test', { systemPrompt: 'system prompt\nsecond line' })
+    const groupInput = [
+      '群聊系统：这条消息已经提及你，请直接回复。',
+      '',
+      '以下是群聊记录：',
+      `用户：${'长文本'.repeat(4000)}`,
+      '',
+      '当前消息：检查这个问题',
+    ].join('\n')
+    manager.send('chat-session-codex-1', groupInput, { systemPrompt: 'system prompt\nsecond line' })
 
     expect(testState.spawnCalls[0]).toMatchObject({
       command: 'cmd.exe',
@@ -147,15 +171,61 @@ describe('coding agent Windows process launch', () => {
     expect(testState.spawnCalls[0].args[3]).not.toContain('\n')
     expect(testState.spawnCalls[0].args[3]).not.toContain('\r')
     expect(testState.spawnCalls[0].args[3]).toContain('^"--model^"')
-    expect(testState.spawnCalls[0].args[3]).toContain('^"test^"')
+    expect(testState.spawnCalls[0].args[3]).toContain('^"-^"')
+    expect(testState.spawnCalls[0].args[3]).not.toContain('群聊系统')
+    expect(testState.spawnCalls[0].args[3].length).toBeLessThan(8191)
     expect(testState.spawnCalls[0].args[3]).not.toContain('system^ prompt\r\n\r\ntest')
     expect(testState.spawnCalls[0].options).toMatchObject({
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsVerbatimArguments: true,
       windowsHide: true,
     })
+    expect(testState.spawnCalls[0].child.stdin.end).toHaveBeenCalledWith(`${groupInput}\n`)
 
     const run = (manager as any).runs.get('agent-session-codex-1')
+    if (run?.idleTimer) clearTimeout(run.idleTimer)
+    ;(manager as any).runs.clear()
+    ;(manager as any).sessionIndex.clear()
+  })
+
+  it('keeps scoped Claude prompts on file instead of adding a CLI prompt payload', () => {
+    const manager = new CodingAgentRunManager()
+    ;(manager as any).ensureDbSession = () => {}
+    ;(manager as any).addUserMessage = () => {}
+    ;(manager as any).emitToChat = () => {}
+    ;(manager as any).markChatRunCompleted = () => {}
+
+    manager.start({
+      agentSessionId: 'agent-session-single-claude-1',
+      agentId: 'claude-code',
+      mode: 'scoped',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'claude-test',
+      sessionId: 'chat-session-single-claude-1',
+      command: 'C:\\Users\\Administrator\\AppData\\Roaming\\npm\\claude.cmd',
+      args: [
+        '--settings',
+        'C:\\Users\\Administrator\\.hermes-web-ui\\settings.json',
+        '--append-system-prompt-file',
+        'C:\\Users\\Administrator\\.hermes-web-ui\\hermes-rules.md',
+      ],
+      shellCommand: 'claude',
+      workspaceDir: process.cwd(),
+      state: { messages: [], isWorking: false, events: [], queue: [] },
+    })
+
+    manager.send('chat-session-single-claude-1', 'test', {
+      systemPrompt: 'ordinary single-chat prompt',
+    })
+
+    const commandLine = testState.spawnCalls[0].args[3]
+    expect(commandLine).toContain('^"--append-system-prompt-file^"')
+    expect(commandLine).toContain('hermes-rules.md')
+    expect(commandLine).not.toContain('^"--append-system-prompt^"')
+    expect(commandLine).not.toContain('ordinary^ single-chat^ prompt')
+
+    const run = (manager as any).runs.get('agent-session-single-claude-1')
     if (run?.idleTimer) clearTimeout(run.idleTimer)
     ;(manager as any).runs.clear()
     ;(manager as any).sessionIndex.clear()
@@ -254,7 +324,10 @@ describe('coding agent Windows process launch', () => {
     const call = testState.spawnCalls[0]
     expect(call.args[3]).toContain('^"--image^"')
     expect(call.args[3]).toContain('C:\\Users\\Administrator\\Pictures\\sample^ image.png')
-    expect(call.options.stdio).toEqual(['ignore', 'pipe', 'pipe'])
+    expect(call.args[3]).toContain('^"-^"')
+    expect(call.args[3]).not.toContain('^"inspect^ this^ image^"')
+    expect(call.options.stdio).toEqual(['pipe', 'pipe', 'pipe'])
+    expect(call.child.stdin.end).toHaveBeenCalledWith('inspect this image\n')
 
     const run = (manager as any).runs.get('agent-session-codex-image-1')
     if (run?.idleTimer) clearTimeout(run.idleTimer)

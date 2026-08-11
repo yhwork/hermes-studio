@@ -10,6 +10,8 @@ import { useSessionSearch } from '@/composables/useSessionSearch'
 import { useAppStore } from '@/stores/hermes/app'
 import AuthEventListener from '@/components/auth/AuthEventListener.vue'
 import { desktopBridge } from '@/utils/desktop-bridge'
+import { naiveLocaleFor } from '@/constants/naiveLocale'
+import { naiveRtlFor } from '@/constants/naiveRtl'
 
 const AppSidebar = defineAsyncComponent(async () => (await import('@/components/layout/AppSidebar.vue')).default)
 const DesktopTitleBar = defineAsyncComponent(async () => (await import('@/components/layout/DesktopTitleBar.vue')).default)
@@ -17,18 +19,30 @@ const SessionSearchModal = defineAsyncComponent(async () => (await import('@/com
 const DefaultCredentialPrompt = defineAsyncComponent(async () => (await import('@/components/auth/DefaultCredentialPrompt.vue')).default)
 const ProviderConfigurationPrompt = defineAsyncComponent(async () => (await import('@/components/hermes/models/ProviderConfigurationPrompt.vue')).default)
 const WebPet = defineAsyncComponent(async () => (await import('@/components/hermes/pets/WebPet.vue')).default)
+const GlobalPendingActions = defineAsyncComponent(async () => (await import('@/components/layout/GlobalPendingActions.vue')).default)
 
-const { isDark, isComic } = useTheme()
-const { t } = useI18n()
+const {
+  isDark,
+  isComic,
+  customization,
+  hasBackgroundImage,
+  syncThemeFromServer,
+} = useTheme()
+const { t, locale } = useI18n()
+const naiveLocale = computed(() => naiveLocaleFor(locale.value))
+const naiveRtl = computed(() => naiveRtlFor(locale.value))
 const appStore = useAppStore()
 const route = useRoute()
 const { sessionSearchOpen } = useSessionSearch()
 
-const themeOverrides = computed(() => getThemeOverrides(isDark.value, isComic.value))
+const themeOverrides = computed(() =>
+  getThemeOverrides(isDark.value, isComic.value, customization.value),
+)
 const naiveTheme = computed(() => isDark.value ? darkTheme : null)
 
 const isLoginPage = computed(() => route.name === 'login')
 const isStandaloneChatPage = computed(() => route.meta?.standaloneChat === true)
+const isInviteOnlyPage = computed(() => route.meta?.inviteOnly === true)
 const usesPageSidebar = computed(() =>
   ['hermes.chat', 'hermes.session', 'hermes.history', 'hermes.historySession', 'hermes.globalAgent', 'hermes.globalAgentSession', 'hermes.groupChat', 'hermes.groupChatRoom', 'hermes.workflow'].includes(route.name as string),
 )
@@ -65,8 +79,8 @@ function handleMobileMenuClick() {
   appStore.toggleSidebar()
 }
 
-watch(isLoginPage, (loginPage) => {
-  if (loginPage) {
+watch([isLoginPage, isInviteOnlyPage], ([loginPage, inviteOnlyPage]) => {
+  if (loginPage || inviteOnlyPage) {
     appStore.stopHealthPolling()
     return
   }
@@ -77,6 +91,9 @@ watch(isLoginPage, (loginPage) => {
 })
 
 onMounted(() => {
+  if (!isInviteOnlyPage.value) {
+    void syncThemeFromServer().catch(() => undefined)
+  }
   const bridge = desktopBridge()
   if (!bridge?.isDesktop || (desktopPlatform.value !== 'win32' && bridge.windowKind !== 'chat')) return
   bridge.getWindowState?.()
@@ -98,13 +115,31 @@ useKeyboard()
 </script>
 
 <template>
-  <NConfigProvider :theme="naiveTheme" :theme-overrides="themeOverrides">
+  <NConfigProvider
+    :theme="naiveTheme"
+    :theme-overrides="themeOverrides"
+    :locale="naiveLocale.locale"
+    :date-locale="naiveLocale.dateLocale"
+    :rtl="naiveRtl"
+  >
     <NMessageProvider>
       <AuthEventListener />
       <NDialogProvider>
         <NNotificationProvider>
           <router-view v-if="isDesktopPetRoute" />
-          <div v-else class="app-shell" :class="[desktopPlatformClass, { desktop: isDesktopShell, 'desktop-chat-window': isDesktopChatWindow, 'desktop-window-maximized': isDesktopWindowMaximized }]">
+          <div
+            v-else
+            class="app-shell"
+            :class="[
+              desktopPlatformClass,
+              {
+                desktop: isDesktopShell,
+                'desktop-chat-window': isDesktopChatWindow,
+                'desktop-window-maximized': isDesktopWindowMaximized,
+                'app-shell--custom-background': hasBackgroundImage,
+              },
+            ]"
+          >
             <DesktopTitleBar
               v-if="showDesktopTitleBar"
               :standalone="isLoginPage || isDesktopChatWindow"
@@ -128,6 +163,7 @@ useKeyboard()
           <SessionSearchModal v-if="!isDesktopPetRoute && !isStandaloneChatPage && sessionSearchOpen" />
           <DefaultCredentialPrompt v-if="!isDesktopPetRoute && !isStandaloneChatPage" />
           <ProviderConfigurationPrompt v-if="!isDesktopPetRoute && !isStandaloneChatPage" />
+          <GlobalPendingActions v-if="!isLoginPage && !isDesktopPetRoute && !isStandaloneChatPage" />
         </NNotificationProvider>
       </NDialogProvider>
     </NMessageProvider>
@@ -146,9 +182,29 @@ useKeyboard()
   display: flex;
   flex-direction: column;
   background-color: $bg-primary;
+
+  &::after {
+    content: "";
+    position: absolute;
+    z-index: 0;
+    inset: 0;
+    background-image: var(--app-background-image, none);
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: cover;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+  }
+
+  &--custom-background::after {
+    opacity: 1;
+  }
 }
 
 .app-layout {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -179,6 +235,92 @@ useKeyboard()
     border-radius: 14px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
   }
+}
+
+.app-shell--custom-background {
+  .app-layout {
+    background-color: transparent;
+  }
+
+  .app-main {
+    background-color: transparent;
+
+    &--card {
+      background-color: rgba(var(--bg-main-surface-rgb), 0.72);
+      -webkit-backdrop-filter: blur(8px) saturate(110%);
+      backdrop-filter: blur(8px) saturate(110%);
+    }
+  }
+
+  :deep(.chat-panel),
+  :deep(.history-panel),
+  :deep(.group-chat-panel),
+  :deep(.workflow-view),
+  :deep(.petdex-view) {
+    background-color: transparent;
+  }
+
+  :deep(.sidebar),
+  :deep(.chat-panel > .session-list),
+  :deep(.history-panel > .session-list),
+  :deep(.group-chat-panel > .room-sidebar),
+  :deep(.workflow-view > .workflow-sidebar) {
+    background-color: rgba(var(--bg-sidebar-surface-rgb), 0.72);
+    -webkit-backdrop-filter: blur(8px) saturate(110%);
+    backdrop-filter: blur(8px) saturate(110%);
+  }
+
+  :deep(.history-panel > .chat-main),
+  :deep(.workflow-view > .workflow-main) {
+    background-color: rgba(var(--bg-main-surface-rgb), 0.72);
+    -webkit-backdrop-filter: blur(8px) saturate(110%);
+    backdrop-filter: blur(8px) saturate(110%);
+  }
+
+  :deep(.chat-panel > .chat-main),
+  :deep(.group-chat-panel > .chat-main) {
+    background-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  :deep(.desktop-titlebar),
+  :deep(.chat-panel > .chat-main > .chat-header),
+  :deep(.group-chat-panel > .chat-main > .chat-header) {
+    background-color: rgba(var(--bg-main-surface-rgb), 0.72);
+    -webkit-backdrop-filter: blur(8px) saturate(110%);
+    backdrop-filter: blur(8px) saturate(110%);
+  }
+
+  :deep(.chat-input-area),
+  :deep(.coding-agents-content) {
+    background-color: transparent;
+  }
+
+  :deep(.chat-main-content),
+  :deep(.group-chat-surface) {
+    background-color: rgba(var(--bg-main-surface-rgb), 0.42);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  :deep(.virtual-message-list),
+  :deep(.group-message-shell) {
+    background-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  :deep(.chat-input-area .input-wrapper) {
+    background-color: rgba(var(--bg-main-surface-rgb), 0.72);
+    -webkit-backdrop-filter: blur(8px) saturate(110%);
+    backdrop-filter: blur(8px) saturate(110%);
+  }
+
+  :deep(.browser-settings-page > .settings-card) {
+    background-color: transparent;
+  }
+
 }
 
 .app-shell.desktop-platform-darwin,
@@ -318,6 +460,7 @@ useKeyboard()
 }
 
 .node-warning-bar {
+  position: relative;
   flex: 0 0 auto;
   width: 100%;
   z-index: 100;

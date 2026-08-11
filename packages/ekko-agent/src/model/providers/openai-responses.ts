@@ -13,12 +13,13 @@ import type {
   ModelUsage,
 } from '../types'
 import { isPlainRecord, parseJson, postJson, postStream, providerUrl, readServerSentEvents } from '../http'
-import { collectModelEvents } from '../messages'
+import { collectModelEvents, normalizeAgentReasoning } from '../messages'
 
 interface OpenAIResponsesPayload {
   model: string
   instructions?: string
   input: OpenAIResponseInputItem[]
+  include?: ['reasoning.encrypted_content']
   temperature?: number
   max_output_tokens?: number
   reasoning?: {
@@ -33,7 +34,6 @@ interface OpenAIResponsesPayload {
   }>
   tool_choice?: 'auto' | 'none' | 'required'
   stream?: boolean
-  metadata?: Record<string, unknown>
   store: false
 }
 
@@ -56,6 +56,16 @@ type OpenAIResponseInputItem =
       call_id: string
       output: string
     }
+  | OpenAIReasoningInputItem
+
+interface OpenAIReasoningInputItem {
+  type: 'reasoning'
+  id?: string
+  summary?: Array<{ type: 'summary_text'; text: string }>
+  content?: Array<{ type: 'reasoning_text'; text: string }>
+  encrypted_content?: string
+  status?: string
+}
 
 interface OpenAIResponsesResponse {
   id?: string
@@ -67,6 +77,8 @@ interface OpenAIResponsesResponse {
     phase?: string
     content?: Array<{ type?: string; text?: string }>
     summary?: Array<{ type?: string; text?: string }>
+    encrypted_content?: string
+    status?: string
     name?: string
     call_id?: string
     arguments?: string
@@ -110,6 +122,10 @@ export class OpenAIResponsesModelClient implements ModelClient {
     this.capabilities = { ...capabilities, ...config.capabilities }
   }
 
+  requestTarget(): string {
+    return responsesUrl(this.config)
+  }
+
   async create(request: ModelRequest): Promise<ModelResponse> {
     if (this.config.id === 'openai-codex') {
       const output = await collectModelEvents(this.stream({ ...request, stream: true }))
@@ -143,7 +159,15 @@ export class OpenAIResponsesModelClient implements ModelClient {
     const messagePhasesByIndex = new Map<number, string>()
     for await (const event of readServerSentEvents(response)) {
       if (event === '[DONE]') {
-        yield { type: 'done' }
+        yield {
+          type: 'done',
+          response: normalizeStreamedResponse(
+            {},
+            collectedOutputItems,
+            streamedText,
+            streamedReasoning,
+          ),
+        }
         return
       }
       const chunk = parseJson<Record<string, unknown>>(event)
@@ -195,29 +219,48 @@ export class OpenAIResponsesModelClient implements ModelClient {
         return
       }
       if (chunk.type === 'response.completed' && isPlainRecord(chunk.response)) {
-        const terminal = chunk.response as OpenAIResponsesResponse
-        const output = collectedOutputItems.length > 0
-          ? collectedOutputItems
-          : terminal.output?.length
-            ? terminal.output
-            : streamedText
-              ? [{
-                  type: 'message',
-                  content: [{ type: 'output_text', text: streamedText }],
-                }]
-              : []
-        const normalized = normalizeOpenAIResponsesResponse({ ...terminal, output })
-        if (!normalized.content && streamedText) normalized.content = streamedText
-        if (!normalized.reasoning && streamedReasoning) normalized.reasoning = streamedReasoning
-        yield { type: 'done', response: normalized }
+        yield {
+          type: 'done',
+          response: normalizeStreamedResponse(
+            chunk.response as OpenAIResponsesResponse,
+            collectedOutputItems,
+            streamedText,
+            streamedReasoning,
+          ),
+        }
         return
       }
     }
   }
 }
 
+function normalizeStreamedResponse(
+  terminal: OpenAIResponsesResponse,
+  collectedOutputItems: NonNullable<OpenAIResponsesResponse['output']>,
+  streamedText: string,
+  streamedReasoning: string,
+): ModelResponse {
+  const output = collectedOutputItems.length > 0
+    ? collectedOutputItems
+    : terminal.output?.length
+      ? terminal.output
+      : streamedText
+        ? [{
+            type: 'message',
+            content: [{ type: 'output_text', text: streamedText }],
+          }]
+        : []
+  const normalized = normalizeOpenAIResponsesResponse({ ...terminal, output })
+  if (!normalized.content && streamedText) normalized.content = streamedText
+  if (!normalized.reasoning && streamedReasoning) {
+    normalized.reasoning = normalizeAgentReasoning(streamedReasoning)
+  }
+  return normalized
+}
+
 export function toOpenAIResponsesPayload(config: ModelProviderConfig, request: ModelRequest): OpenAIResponsesPayload {
   const systemMessages = request.messages.filter(message => message.role === 'system')
+  const tools = request.tools?.length ? request.tools.map(toOpenAIResponseTool) : undefined
   const replayableToolCallIds = new Set(
     request.messages.flatMap(message => message.role === 'assistant'
       ? (message.toolCalls ?? [])
@@ -225,11 +268,11 @@ export function toOpenAIResponsesPayload(config: ModelProviderConfig, request: M
           .map(toolCall => toolCall.id)
       : []),
   )
-  const supportsMetadata = config.id !== 'xai-oauth' && config.id !== 'openai-codex'
   const supportsSamplingControls = config.id !== 'openai-codex'
   return {
     model: request.model ?? config.defaultModel,
     instructions: systemMessages.map(message => message.content).join('\n\n') || undefined,
+    ...(shouldIncludeEncryptedReasoning(config) ? { include: ['reasoning.encrypted_content'] as const } : {}),
     input: request.messages
       .filter(message => message.role !== 'system')
       .flatMap(message => toOpenAIResponseInput(message, replayableToolCallIds)),
@@ -243,10 +286,13 @@ export function toOpenAIResponsesPayload(config: ModelProviderConfig, request: M
           },
         }
       : {}),
-    tools: request.tools?.map(toOpenAIResponseTool),
-    tool_choice: request.toolChoice,
+    ...(tools
+      ? {
+          tools,
+          ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+        }
+      : {}),
     stream: request.stream,
-    ...(supportsMetadata && request.metadata ? { metadata: request.metadata } : {}),
     store: false,
   }
 }
@@ -268,7 +314,10 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     id: response.id,
     model: response.model,
     content: outputContent || (messageItems.length === 0 ? response.output_text ?? '' : ''),
-    reasoning: normalizeReasoning(response),
+    reasoning: normalizeAgentReasoning(
+      normalizeReasoning(response),
+      openAIResponsesReasoningDetails(response.output),
+    ),
     toolCalls,
     usage: response.usage ? normalizeUsage(response.usage) : undefined,
     finishReason: response.status,
@@ -349,7 +398,9 @@ function toOpenAIResponseInput(
     return items
   }
   if (message.role === 'assistant') {
-    const items: OpenAIResponseInputItem[] = []
+    const items: OpenAIResponseInputItem[] = [
+      ...openAIResponsesReasoningInput(message),
+    ]
     if (message.content) items.push({ role: 'assistant', content: message.content })
     for (const toolCall of message.toolCalls ?? []) {
       if (!toolCall.id || !toolCall.name.trim()) continue
@@ -373,6 +424,32 @@ function toOpenAIResponseInput(
     }]
   }
   return [{ role: 'user', content: message.content }]
+}
+
+function openAIResponsesReasoningInput(message: AgentMessage): OpenAIReasoningInputItem[] {
+  if (message.reasoning?.native?.format !== 'openai-responses-items') return []
+  if (!Array.isArray(message.reasoning.native.data)) return []
+  return message.reasoning.native.data
+    .filter(isPlainRecord)
+    .filter(item => item.type === 'reasoning')
+    .map(item => ({ ...item, type: 'reasoning' }) as OpenAIReasoningInputItem)
+}
+
+function openAIResponsesReasoningDetails(output: OpenAIResponsesResponse['output']) {
+  const items = output?.filter(item => item.type === 'reasoning') ?? []
+  return items.length
+    ? {
+        format: 'openai-responses-items' as const,
+        data: items,
+      }
+    : undefined
+}
+
+function shouldIncludeEncryptedReasoning(config: ModelProviderConfig): boolean {
+  const identifier = `${config.id} ${config.baseUrl || ''}`.toLowerCase()
+  return config.type === 'openai' ||
+    config.id === 'openai' ||
+    identifier.includes('api.openai.com')
 }
 
 function toOpenAIResponseTool(tool: AgentToolDefinition): NonNullable<OpenAIResponsesPayload['tools']>[number] {

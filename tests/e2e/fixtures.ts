@@ -33,6 +33,18 @@ interface MockSkillBundlePayload {
   skills: string[]
 }
 
+interface MockThemePayload {
+  fontSize: number
+  textColor: string | null
+  accentColor: string | null
+  background: {
+    name: string
+    mime: string | null
+    updatedAt: number
+  } | null
+  updatedAt: number
+}
+
 interface MockHermesApiOptions {
   tokenValidationStatus?: number
   initialProfileName?: 'default' | 'research'
@@ -43,6 +55,11 @@ interface MockHermesApiOptions {
   bundles?: MockSkillBundlePayload[]
   workflows?: unknown[]
   workflowRuns?: unknown[]
+  workflowSchedules?: unknown[]
+  workflowScheduleError?: string
+  workflowScheduleDelays?: Record<string, number>
+  workflowScheduleGetSnapshotAtRequest?: boolean
+  workflowScheduleMutationDelays?: Partial<Record<'POST' | 'PATCH' | 'DELETE', number>>
   workflowImportDocument?: unknown
   workflowImportPreviewError?: string
   channelCredentials?: boolean
@@ -54,6 +71,7 @@ interface MockHermesApiOptions {
     models: string[]
     [key: string]: unknown
   }>
+  theme?: Partial<MockThemePayload>
 }
 
 export const TEST_MODEL_GROUP = {
@@ -138,8 +156,17 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
   const tokenValidationStatus = options.tokenValidationStatus ?? 200
   let activeProfileName = options.initialProfileName ?? 'research'
   const sessionCategories = [...(options.sessionCategories ?? [])]
+  let workflowSchedules: any[] = [...(options.workflowSchedules ?? [])]
   const skillBundles = [...(options.bundles ?? [])]
   let channelCredentialsPresent = options.channelCredentials ?? false
+  let theme: MockThemePayload = {
+    fontSize: 14,
+    textColor: null,
+    accentColor: null,
+    background: null,
+    updatedAt: 0,
+    ...options.theme,
+  }
   let providerEditor = {
     id: 'test-provider',
     label: 'Test Provider',
@@ -187,7 +214,42 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
         await route.fulfill(jsonResponse({ error: 'Invalid username or password' }, tokenValidationStatus))
         return
       }
-      await route.fulfill(jsonResponse({ token: TEST_ACCESS_KEY }))
+      await route.fulfill(jsonResponse({
+        token: TEST_ACCESS_KEY,
+        userId: 1,
+        theme,
+      }))
+      return
+    }
+
+    if (pathname === '/api/theme/background') {
+      if (request.method() === 'GET' && theme.background) {
+        await route.fulfill({
+          status: 200,
+          contentType: theme.background.mime || 'image/png',
+          body: Buffer.from(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2V9sAAAAASUVORK5CYII=',
+            'base64',
+          ),
+        })
+        return
+      }
+      await route.fulfill(jsonResponse({ error: 'Theme background not found' }, 404))
+      return
+    }
+
+    if (pathname === '/api/theme') {
+      if (request.method() === 'GET') {
+        await route.fulfill(jsonResponse(theme))
+        return
+      }
+      if (request.method() === 'PUT') {
+        const patch = JSON.parse(request.postData() || '{}') as Partial<MockThemePayload>
+        theme = { ...theme, ...patch, updatedAt: Date.now() }
+        await route.fulfill(jsonResponse(theme))
+        return
+      }
+      await route.fulfill(jsonResponse({ error: 'Method not allowed' }, 405))
       return
     }
 
@@ -245,6 +307,53 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
       const workflow: any = (options.workflows || []).find((item: any) => item?.id === workflowId)
       await route.fulfill(workflow ? jsonResponse({ format: 'hermes-studio.workflow', version: 1, definition: { name: workflow.name, nodes: workflow.nodes, edges: workflow.edges, viewport: workflow.viewport } }) : jsonResponse({ error: 'workflow not found' }, 404))
       return
+    }
+
+    if (/^\/api\/hermes\/workflows\/[^/]+\/schedules(?:\/[^/]+)?$/.test(pathname)) {
+      if (options.workflowScheduleError) {
+        await route.fulfill(jsonResponse({ error: options.workflowScheduleError }, 500))
+        return
+      }
+      const parts = pathname.split('/')
+      const workflowId = parts[4]
+      const scheduleId = parts[6]
+      if (request.method() === 'GET') {
+        const schedules = options.workflowScheduleGetSnapshotAtRequest
+          ? workflowSchedules.filter(item => item.workflow_id === workflowId)
+          : null
+        const delay = options.workflowScheduleDelays?.[workflowId] || 0
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay))
+        await route.fulfill(jsonResponse({ schedules: schedules ?? workflowSchedules.filter(item => item.workflow_id === workflowId) }))
+        return
+      }
+      let body: Record<string, any> = {}
+      try { body = JSON.parse(request.postData() || '{}') } catch {}
+      if (request.method() === 'POST') {
+        const schedule = { id: `schedule-${workflowSchedules.length + 1}`, workflow_id: workflowId, profile: 'research', concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: Date.now() + 3_600_000, last_run_id: null, last_error: null, created_at: Date.now(), updated_at: Date.now(), ...body }
+        workflowSchedules = [...workflowSchedules, schedule]
+        const delay = options.workflowScheduleMutationDelays?.POST || 0
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay))
+        await route.fulfill(jsonResponse({ schedule }, 201))
+        return
+      }
+      if (request.method() === 'PATCH') {
+        const current = workflowSchedules.find(item => item.id === scheduleId && item.workflow_id === workflowId)
+        const saved = current ? { ...current, ...body, updated_at: Date.now() } : null
+        if (saved) workflowSchedules = workflowSchedules.map(item => item.id === scheduleId ? saved : item)
+        const delay = options.workflowScheduleMutationDelays?.PATCH || 0
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay))
+        await route.fulfill(saved
+          ? jsonResponse({ schedule: saved })
+          : jsonResponse({ error: 'workflow schedule not found' }, 404))
+        return
+      }
+      if (request.method() === 'DELETE') {
+        workflowSchedules = workflowSchedules.filter(item => item.id !== scheduleId || item.workflow_id !== workflowId)
+        const delay = options.workflowScheduleMutationDelays?.DELETE || 0
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay))
+        await route.fulfill(jsonResponse({ ok: true }))
+        return
+      }
     }
 
     if (/^\/api\/hermes\/workflows\/[^/]+\/run$/.test(pathname) && request.method() === 'POST') {
@@ -496,6 +605,15 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
       return
     }
 
+    if (pathname === '/api/hermes/petdex/manifest') {
+      await route.fulfill(jsonResponse({
+        generatedAt: '2026-07-28T00:00:00.000Z',
+        total: 0,
+        pets: [],
+      }))
+      return
+    }
+
     if (pathname === '/api/hermes/profiles') {
       await route.fulfill(jsonResponse({
         profiles: [
@@ -585,6 +703,41 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
       return
     }
 
+    if (pathname === '/api/coding-agents' && request.method() === 'GET') {
+      await route.fulfill(jsonResponse({ tools: [] }))
+      return
+    }
+
+    if (
+      request.method() === 'GET' &&
+      /^\/api\/coding-agents\/(?:claude-code|codex)\/config-files\/[^/]+$/.test(pathname)
+    ) {
+      const key = pathname.split('/').at(-1) || 'config'
+      await route.fulfill(jsonResponse({
+        key,
+        path: key,
+        absolutePath: `/tmp/${key}`,
+        language: 'text',
+        content: '',
+        exists: false,
+        size: 0,
+        profile: 'research',
+        provider: '',
+        rootDir: '/tmp',
+      }))
+      return
+    }
+
+    if (pathname === '/api/hermes/group-chat/rooms' && request.method() === 'GET') {
+      await route.fulfill(jsonResponse({ rooms: [] }))
+      return
+    }
+
+    if (pathname === '/api/hermes/group-chat-link/v1/connections' && request.method() === 'GET') {
+      await route.fulfill(jsonResponse({ connections: [] }))
+      return
+    }
+
     if (pathname === '/api/cron-history') {
       await route.fulfill(jsonResponse({ runs: [] }))
       return
@@ -661,8 +814,12 @@ function makeSocket(url, options) {
       for (const handler of handlers) handler(payload)
     },
   }
-  state.sockets.push(socket)
-  state.latest = socket
+  state.allSockets = state.allSockets || []
+  state.allSockets.push(socket)
+  if (String(url).endsWith('/chat-run') || String(url).endsWith('/global-agent')) {
+    state.sockets.push(socket)
+    state.latest = socket
+  }
   return socket
 }
 export function io(url, options) {

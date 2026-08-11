@@ -96,6 +96,27 @@ md.use(markdownItKatex, {
   strict: 'ignore',
 })
 
+// A conversation carries whatever language the person writes in, and one
+// message can hold both. dir="auto" lets each block pick its own direction from
+// its first strong character, so an Arabic paragraph reads right-to-left even
+// while the interface is in English — and the reverse.
+const AUTO_DIRECTION_TOKENS = new Set([
+  'paragraph_open',
+  'heading_open',
+  'blockquote_open',
+  'list_item_open',
+  'th_open',
+  'td_open',
+  'dt_open',
+  'dd_open',
+])
+
+md.core.ruler.push('auto_direction', (state) => {
+  for (const token of state.tokens) {
+    if (AUTO_DIRECTION_TOKENS.has(token.type)) token.attrSet('dir', 'auto')
+  }
+})
+
 const defaultFenceRenderer = md.renderer.rules.fence?.bind(md.renderer.rules)
 
 md.renderer.rules.fence = (tokens, idx, options, env, self) => {
@@ -512,7 +533,7 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
 </script>
 
 <template>
-  <div ref="markdownBody" class="markdown-body" v-html="renderedHtml" @click="handleMarkdownClick"></div>
+  <div ref="markdownBody" class="markdown-body" dir="auto" v-html="renderedHtml" @click="handleMarkdownClick"></div>
   <Teleport to="body">
     <div v-if="previewUrl" class="image-preview-overlay" @click.self="previewUrl = null">
       <img :src="previewUrl" class="image-preview-img" @click="previewUrl = null" />
@@ -524,7 +545,18 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
 @use '@/styles/variables' as *;
 
 .markdown-body {
-  font-size: 14px;
+  // Code keeps its own direction whatever language surrounds it: a snippet
+  // inside an Arabic sentence must not be mirrored.
+  pre,
+  code,
+  kbd,
+  samp {
+    direction: ltr;
+    unicode-bidi: isolate;
+    text-align: start;
+  }
+
+  font-size: var(--font-size-base);
   line-height: 1.65;
   width: 100%;
   min-width: 0;
@@ -546,7 +578,7 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
   }
 
   ul, ol {
-    padding-left: 20px;
+    padding-inline-start: 20px;
     margin: 4px 0 8px;
   }
 
@@ -737,7 +769,7 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
   blockquote {
     margin: 8px 0;
     padding: 4px 12px;
-    border-left: 3px solid $border-color;
+    border-inline-start: 3px solid $border-color;
     color: $text-secondary;
   }
 
@@ -764,7 +796,7 @@ async function handleMarkdownClick(event: MouseEvent): Promise<void> {
     th, td {
       padding: 6px 12px;
       border: 1px solid $border-color;
-      text-align: left;
+      text-align: start;
       font-size: 13px;
     }
 

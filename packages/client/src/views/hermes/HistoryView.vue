@@ -1054,6 +1054,7 @@ function handleBatchDeleteConfirm() {
             ref="historyMessageListRef"
             :session="historySession"
             :load-older="loadOlderHistoryMessages"
+            scroll-scope="history"
           />
         </div>
         <OutlinePanel
@@ -1109,8 +1110,8 @@ function handleBatchDeleteConfirm() {
 
   &.collapsed {
     width: 0;
-    margin-left: 0;
-    margin-right: 0;
+    margin-inline-start: 0;
+    margin-inline-end: 0;
     border: none;
     box-shadow: none;
     opacity: 0;
@@ -1294,7 +1295,7 @@ function handleBatchDeleteConfirm() {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
 
   &--sidebar-collapsed {
-    margin-left: 10px;
+    margin-inline-start: 10px;
   }
 }
 

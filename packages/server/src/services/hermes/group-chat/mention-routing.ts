@@ -6,12 +6,16 @@ type MentionableAgent = {
     agentId?: string
 }
 
+export type StructuredMention = {
+    type: 'agent' | 'all'
+    participantId?: string
+}
+
 type MentionRange = {
     start: number
     end: number
 }
 
-const BEFORE_BOUNDARY = new Set(['(', '[', '{', '<'])
 const AFTER_BOUNDARY = new Set(['.', ',', '!', '?', ';', ':', '，', '。', '！', '？', '；', '：', ')', ']', '}', '>'])
 const QUOTED_MESSAGE_BLOCK_RE = /<quoted_message(?:\s[^>]*)?>[\s\S]*?<\/quoted_message>/gi
 
@@ -28,7 +32,9 @@ export function isReservedMentionName(name: string): boolean {
 }
 
 function isBeforeBoundary(char: string | undefined): boolean {
-    return char === undefined || /\s/.test(char) || BEFORE_BOUNDARY.has(char)
+    // Keep ASCII identifiers and email-like text from becoming mentions, while
+    // allowing the CJK, emoji, and punctuation boundaries used in natural chat.
+    return char === undefined || !/[a-zA-Z0-9_]/.test(char)
 }
 
 function isAfterBoundary(char: string | undefined): boolean {
@@ -83,6 +89,22 @@ export function resolveMentionTargets<T extends MentionableAgent>(
     }
 
     return candidates.filter((agent) => isAgentMentioned(content, agent.name))
+}
+
+export function resolveStructuredMentionTargets<T extends MentionableAgent>(
+    agents: T[],
+    mentions: StructuredMention[],
+    senderId: string,
+): T[] {
+    const candidates = agents.filter((agent) => !isSenderAgent(agent, senderId))
+    if (mentions.some(mention => mention.type === 'all')) return candidates
+    const participantIds = new Set(
+        mentions
+            .filter((mention): mention is StructuredMention & { type: 'agent'; participantId: string } =>
+                mention.type === 'agent' && typeof mention.participantId === 'string' && mention.participantId.length > 0)
+            .map(mention => mention.participantId),
+    )
+    return candidates.filter(agent => participantIds.has(agent.agentId || agent.id || ''))
 }
 
 export function stripMentionRoutingTokens(content: string, ownAgentName: string): string {

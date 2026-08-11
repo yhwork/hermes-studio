@@ -1,5 +1,5 @@
 import { execFile } from 'child_process'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { existsSync, readdirSync, realpathSync } from 'fs'
 import { chmod, mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { homedir } from 'os'
@@ -116,7 +116,12 @@ export interface CodingAgentLaunchInput extends CodingAgentConfigScope {
   agentSessionId?: string
   agentNativeSessionId?: string
   isolateSettings?: boolean
-  sessionSource?: 'global_agent' | 'workflow'
+  sessionSource?: 'global_agent' | 'workflow' | 'group_chat'
+  groupSystemPrompt?: string
+  groupRuntimeScope?: {
+    roomId: string
+    agentId: string
+  }
 }
 
 export interface CodingAgentLaunchResult {
@@ -619,6 +624,36 @@ function getScopedConfigRoot(id: CodingAgentId, scope: Required<CodingAgentConfi
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'model', scope.profile, scope.provider, id)
 }
 
+function getScopedRuntimeConfigRoot(
+  id: CodingAgentId,
+  scope: Required<CodingAgentConfigScope>,
+  input: Pick<CodingAgentLaunchInput, 'sessionId' | 'agentSessionId' | 'groupRuntimeScope'>,
+): string {
+  const groupRoomId = String(input.groupRuntimeScope?.roomId || '').trim()
+  const groupAgentId = String(input.groupRuntimeScope?.agentId || '').trim()
+  if (groupRoomId && groupAgentId) {
+    const stableSegment = (value: string) => {
+      const readable = value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'scope'
+      const digest = createHash('sha256').update(value).digest('hex').slice(0, 12)
+      return `${readable}_${digest}`
+    }
+    return join(
+      getScopedConfigRoot(id, scope),
+      'group-chat',
+      stableSegment(groupRoomId),
+      stableSegment(groupAgentId),
+    )
+  }
+  const rootDir = getScopedConfigRoot(id, scope)
+  const sessionId = String(input.sessionId || '').trim()
+  const agentSessionId = String(input.agentSessionId || '').trim()
+  if (!sessionId || !agentSessionId) return rootDir
+  const runtimeKey = createHash('sha256')
+    .update(JSON.stringify([sessionId, agentSessionId]))
+    .digest('hex')
+  return join(rootDir, 'runs', runtimeKey)
+}
+
 function getScopedWorkspaceRoot(scope: Required<CodingAgentConfigScope>): string {
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'workspace', scope.profile, scope.provider)
 }
@@ -737,10 +772,10 @@ function expandHomePath(path: string): string {
   return path
 }
 
-function hermesPromptDocument(): string {
+function hermesPromptDocument(systemPrompt = getSystemPrompt()): string {
   return [
     HERMES_PROMPT_BLOCK_BEGIN,
-    getSystemPrompt().trim(),
+    systemPrompt.trim(),
     HERMES_PROMPT_BLOCK_END,
     '',
   ].join('\n')
@@ -1199,13 +1234,18 @@ function getLiveConfigFileDefinition(id: string, key: string): CodingAgentConfig
   }
 }
 
-function getScopedConfigFileDefinition(id: string, key: string, scopeInput: CodingAgentConfigScope = {}): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
+function getScopedConfigFileDefinition(
+  id: string,
+  key: string,
+  scopeInput: CodingAgentConfigScope = {},
+  rootDirOverride?: string,
+): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
   const tool = getCodingAgentDefinition(id)
   if (!tool) return null
   const definition = CONFIG_FILE_DEFINITIONS[tool.id].find(file => file.key === key)
   if (!definition) return null
   const scope = normalizeConfigScope(scopeInput)
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const rootDir = rootDirOverride || getScopedConfigRoot(tool.id, scope)
   return {
     key: definition.key,
     path: definition.path,
@@ -1663,14 +1703,16 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   const preset = PROVIDER_PRESETS.find(item => item.value === provider)
   const apiMode = normalizeLaunchApiMode(input.apiMode, preset?.api_mode || 'chat_completions')
   const reasoningEffort = String(input.reasoningEffort || '').trim()
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const groupSystemPrompt = String(input.groupSystemPrompt || '').trim()
+  const scopedSystemPrompt = groupSystemPrompt || getSystemPrompt()
+  const rootDir = getScopedRuntimeConfigRoot(tool.id, scope, input)
   const workspaceDir = resolveLaunchWorkspaceRoot(scope, input.workspace)
   await mkdir(rootDir, { recursive: true })
   await mkdir(workspaceDir, { recursive: true })
 
   const files: Array<{ key: string; path: string; absolutePath: string }> = []
   const writeScopedFile = async (key: string, content: string) => {
-    const definition = getScopedConfigFileDefinition(tool.id, key, scope)
+    const definition = getScopedConfigFileDefinition(tool.id, key, scope, rootDir)
     if (!definition) return
     await mkdir(dirname(definition.absolutePath), { recursive: true })
     await writeFile(definition.absolutePath, content, 'utf-8')
@@ -1723,7 +1765,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     const globalMcpConfig = globalMcpPath ? await safeReadFile(globalMcpPath) : ''
     const existingMcpConfig = existingMcpPath ? await safeReadFile(existingMcpPath) : ''
     await writeScopedFile('mcp', claudeMcpConfigJson(scope.profile, globalMcpConfig, existingMcpConfig))
-    await writeScopedFile('prompt', hermesPromptDocument())
+    await writeScopedFile('prompt', hermesPromptDocument(scopedSystemPrompt))
 
     const settingsPath = join(rootDir, 'settings.json')
     const mcpPath = join(rootDir, 'mcp.json')
@@ -1768,7 +1810,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
       `model = ${JSON.stringify(model)}`,
       'model_reasoning_summary = "auto"',
       ...(reasoningEffort ? [`model_reasoning_effort = ${JSON.stringify(reasoningEffort)}`] : []),
-      `developer_instructions = ${tomlMultilineString(getSystemPrompt().trim())}`,
+      `developer_instructions = ${tomlMultilineString(scopedSystemPrompt.trim())}`,
       'disable_response_storage = true',
       '',
       `[model_providers.${providerId}]`,
@@ -1854,6 +1896,8 @@ export async function startCodingAgentRun(
   const existingSession = getSession(sessionId)
   const sessionSource = input.sessionSource === 'global_agent'
     ? 'global_agent'
+    : input.sessionSource === 'group_chat'
+      ? 'group_chat'
     : input.sessionSource === 'workflow'
       ? 'workflow'
       : 'coding_agent'
@@ -1911,7 +1955,9 @@ export async function startCodingAgentRun(
     env: runtimeEnv,
     state,
     reasoningEffort: launch.reasoningEffort,
-    sessionSource: sessionSource === 'global_agent' || sessionSource === 'workflow' ? sessionSource : undefined,
+    sessionSource: sessionSource === 'global_agent' || sessionSource === 'workflow' || sessionSource === 'group_chat'
+      ? sessionSource
+      : undefined,
   })
   updateSession(sessionId, {
     source: sessionSource,
@@ -1939,7 +1985,7 @@ export function sendCodingAgentRunInput(
   systemPrompt?: string,
   images: CodingAgentImageInput[] = [],
   storageInput?: string,
-): { runId: string } {
+): { runId: string; messageId?: number } {
   return codingAgentRunManager.send(sessionId, input, { systemPrompt, images, storageInput })
 }
 

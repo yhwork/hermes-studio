@@ -98,6 +98,22 @@ export interface AgentBridgeRunResult extends AgentBridgeResponse {
   error?: string | null
 }
 
+export type AgentBridgeBoundaryInterruptStatus =
+  | 'accepted'
+  | 'already_pending'
+  | 'not_running'
+  | 'run_mismatch'
+  | 'unsupported'
+
+export interface AgentBridgeBoundaryInterrupt extends AgentBridgeResponse {
+  status: AgentBridgeBoundaryInterruptStatus
+  session_id: string
+  run_id?: string
+  phase?: 'model' | 'tool_batch'
+  guarantee: 'strict' | 'none'
+  reason?: string
+}
+
 export interface AgentBridgeSessionTitle extends AgentBridgeResponse {
   session_id: string
   title: string
@@ -116,6 +132,22 @@ export interface AgentBridgeContextEstimate extends AgentBridgeResponse {
   profile?: string
   model?: string
   provider?: string
+}
+
+export interface AgentBridgeProviderCredentials extends AgentBridgeResponse {
+  resolved: boolean
+  requested_provider: string
+  provider?: string
+  api_key?: string
+  base_url?: string
+  api_mode?: string
+  source?: string
+  last_refresh?: string
+  expires_at?: string
+  expires_at_ms?: number
+  error?: string
+  code?: string
+  relogin_required?: boolean
 }
 
 export interface AgentBridgeCommandResult extends AgentBridgeResponse {
@@ -240,7 +272,7 @@ export class AgentBridgeClient {
   private summarizePayload(payload: Record<string, unknown>): Record<string, unknown> {
     const action = String(payload.action || '')
     const summary: Record<string, unknown> = { action }
-    for (const key of ['session_id', 'run_id', 'request_id', 'approval_id', 'profile', 'worker_key']) {
+    for (const key of ['session_id', 'run_id', 'expected_run_id', 'request_id', 'approval_id', 'profile', 'worker_key']) {
       if (payload[key] != null) summary[key] = payload[key]
     }
     if (Array.isArray(payload.conversation_history)) summary.conversation_history_count = payload.conversation_history.length
@@ -519,6 +551,19 @@ export class AgentBridgeClient {
     })
   }
 
+  providerCredentials(
+    profile: string,
+    provider: string,
+    model?: string,
+  ): Promise<AgentBridgeProviderCredentials> {
+    return this.request<AgentBridgeProviderCredentials>({
+      action: 'provider_credentials',
+      profile,
+      provider,
+      ...(model ? { model } : {}),
+    })
+  }
+
   command(sessionId: string, command: string, profile?: string): Promise<AgentBridgeCommandResult> {
     return this.request<AgentBridgeCommandResult>({
       action: 'command',
@@ -611,6 +656,19 @@ export class AgentBridgeClient {
       action: 'interrupt',
       session_id: sessionId,
       message,
+      ...(profile ? { profile } : {}),
+    })
+  }
+
+  requestBoundaryInterrupt(
+    sessionId: string,
+    expectedRunId?: string,
+    profile?: string,
+  ): Promise<AgentBridgeBoundaryInterrupt> {
+    return this.request<AgentBridgeBoundaryInterrupt>({
+      action: 'request_boundary_interrupt',
+      session_id: sessionId,
+      ...(expectedRunId ? { expected_run_id: expectedRunId } : {}),
       ...(profile ? { profile } : {}),
     })
   }

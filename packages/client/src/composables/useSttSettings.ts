@@ -45,7 +45,16 @@ const DEFAULT: SttSettingsData = {
 }
 
 function sanitize(data: Partial<SttSettingsData>): SttSettingsData {
-  const provider = data.provider === 'browser' || data.provider === 'openai' || data.provider === 'custom' || data.provider === 'doubao'
+  const provider = data.provider === 'browser' ||
+    data.provider === 'local' ||
+    data.provider === 'openai' ||
+    data.provider === 'custom' ||
+    data.provider === 'doubao' ||
+    data.provider === 'groq' ||
+    data.provider === 'mistral' ||
+    data.provider === 'xai' ||
+    data.provider === 'elevenlabs' ||
+    data.provider === 'deepinfra'
     ? data.provider
     : DEFAULT.provider
 

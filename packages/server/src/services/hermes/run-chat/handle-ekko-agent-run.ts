@@ -1,24 +1,31 @@
 import type { Server, Socket } from 'socket.io'
 import { createHash, randomUUID } from 'crypto'
-import { inspect } from 'util'
 import {
   createModelClient,
+  DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
   resolveModelProviderConfigs,
   type AgentMessage,
+  type AgentClarificationRequest,
   type AgentOutputMessage,
   type AgentToolCall,
+  type AgentToolApprovalRequest,
   type AgentToolResult,
   type ModelClient,
   type ModelEvent,
   type AgentRuntimeEvent,
-  type EkkoLogCategory,
-  type EkkoLogLevel,
   type ModelProviderConfig,
   type ModelReasoningEffort,
   type ModelRequest,
   type ModelResponse,
 } from '../../../../../ekko-agent/src'
+import {
+  agentReasoningText,
+  normalizeAgentReasoning,
+  serializeAgentReasoningDetails,
+} from '../../../../../ekko-agent/src/model/messages'
 import { getGlobalEkkoAgent } from '../../ekko-agent/manager'
+import { waitForEkkoToolApproval } from '../../ekko-agent/approvals'
+import { waitForEkkoClarification } from '../../ekko-agent/clarifications'
 import { resolveEkkoMcpServers } from '../../ekko-agent/mcp'
 import { resolveEkkoProviderRuntimeConfig } from '../../ekko-agent/provider-runtime'
 import {
@@ -33,13 +40,13 @@ import {
 import type { ChatMessage } from '../../../lib/context-compressor'
 import { logger } from '../../logger'
 import { recordSessionUsage } from '../../usage-recorder'
-import { getProfileDir } from '../hermes-profile'
 import { observeRunChatPetEvent } from '../pet-state-socket'
 import { contentBlocksToString, convertContentBlocksForAgent, extractTextForPreview } from './content-blocks'
 import { buildCompressedHistory, getOrCreateSession } from './compression'
 import { resolveBridgeRunModelConfig, type RunModelGroup } from './model-config'
 import { estimateUsageTokensFromMessages } from './usage'
 import type { ChatCodingAgentId, ContentBlock, QueuedRun, SessionState } from './types'
+import { completeWorkspaceRunCheckpoint, startWorkspaceRunCheckpoint } from './workspace-diff-tracker'
 
 export interface EkkoAgentRunSocketData {
   input: string | ContentBlock[]
@@ -51,12 +58,15 @@ export interface EkkoAgentRunSocketData {
   provider?: string
   model?: string
   model_groups?: RunModelGroup[]
+  instructions?: string
   coding_agent_id?: ChatCodingAgentId
   agent_id?: ChatCodingAgentId
   mode?: 'scoped' | 'global'
   workspace?: string | null
   category_id?: number | null
   source?: string
+  session_source?: 'global_agent' | 'workflow' | 'group_chat'
+  context_compression_enabled?: boolean
   baseUrl?: string
   base_url?: string
   apiKey?: string
@@ -68,6 +78,7 @@ export interface EkkoAgentRunSocketData {
   peerExcludeSocketId?: string
   queue_id?: string
   reasoning_effort?: string
+  background_delegation_enabled?: boolean
   background_delegation_id?: string
   autonomous?: boolean
   onEvent?: (event: string, payload: any) => void
@@ -237,10 +248,13 @@ async function toAgentMessages(messages: Array<ChatMessage | SessionState['messa
       const agentMessage: AgentMessage = {
         role: 'assistant',
         content: contentBlocksToString(message.content as any),
-        reasoning: ('reasoning' in message ? message.reasoning : undefined) || message.reasoning_content || undefined,
+        reasoning: normalizeAgentReasoning(
+          ('reasoning' in message ? message.reasoning : undefined) || message.reasoning_content,
+          'reasoning_details' in message ? message.reasoning_details : undefined,
+        ),
         toolCalls,
       }
-      if (agentMessage.content.trim() || (agentMessage.reasoning?.trim().length ?? 0) > 0 || toolCalls?.length) {
+      if (agentMessage.content.trim() || agentReasoningText(agentMessage.reasoning).trim() || agentMessage.reasoning?.native || toolCalls?.length) {
         result.push(agentMessage)
       }
       continue
@@ -297,65 +311,6 @@ function headerSecretDebugInfo(value: unknown): string {
     : apiKeyDebugInfo(raw)
 }
 
-function consolePayload(value: unknown): string {
-  return inspect(value, {
-    depth: null,
-    colors: false,
-    maxArrayLength: null,
-    maxStringLength: null,
-    breakLength: 120,
-    compact: false,
-  })
-}
-
-function modelRequestDebugInfo(request: ModelRequest): ModelRequest {
-  return {
-    ...request,
-    messages: request.messages.map(message => ({
-      ...message,
-      contentParts: message.contentParts?.map(part => part.type === 'image'
-        ? {
-            ...part,
-            data: `[base64 omitted length=${part.data.length}]`,
-          }
-        : part),
-    })),
-  }
-}
-
-function errorPayload(err: unknown): unknown {
-  if (!(err instanceof Error)) return err
-  const withDetails = err as Error & {
-    provider?: string
-    statusCode?: number
-    retryable?: boolean
-    details?: unknown
-  }
-  return {
-    name: err.name,
-    message: err.message,
-    provider: withDetails.provider,
-    statusCode: withDetails.statusCode,
-    retryable: withDetails.retryable,
-    details: withDetails.details,
-    stack: err.stack,
-  }
-}
-
-function shouldUsePlainChatRequest(config: ModelProviderConfig): boolean {
-  const provider = String(config.id || '').toLowerCase()
-  const baseUrl = String(config.baseUrl || '').toLowerCase()
-  return provider.includes('glm') || baseUrl.includes('bigmodel.cn')
-}
-
-function requestForProvider(request: ModelRequest, config: ModelProviderConfig): ModelRequest {
-  if (!shouldUsePlainChatRequest(config)) return request
-  return {
-    ...request,
-    metadata: undefined,
-  }
-}
-
 function shouldFallbackProtocol(err: unknown): boolean {
   const statusCode = (err as { statusCode?: number } | null)?.statusCode
   return statusCode === 400 || statusCode === 404 || statusCode === 405 || statusCode === 415 || statusCode === 422
@@ -379,10 +334,9 @@ interface PendingToolGroup {
   results: Map<string, { toolName: string; result: AgentToolResult }>
 }
 
-function createConsoleModelClient(
+function createProviderModelClient(
   client: ModelClient,
   context: {
-    sessionId: string
     providerConfig: ModelProviderConfig
     fallback?: {
       client: ModelClient
@@ -395,109 +349,32 @@ function createConsoleModelClient(
     provider: client.provider,
     requestStyle: client.requestStyle,
     capabilities: client.capabilities,
+    requestTarget: request => client.requestTarget?.(request) || '',
     async create(request: ModelRequest): Promise<ModelResponse> {
-      const providerRequest = requestForProvider(request, context.providerConfig)
-      console.log('[ekko-agent] model request', consolePayload({
-        session_id: context.sessionId,
-        provider_config: redactProviderConfig(context.providerConfig),
-        request: modelRequestDebugInfo(providerRequest),
-      }))
       try {
-        const response = await client.create(providerRequest)
-        console.log('[ekko-agent] model request success', consolePayload({
-          session_id: context.sessionId,
-          provider: client.provider,
-          request_style: client.requestStyle,
-          response,
-        }))
-        return response
+        return await client.create(request)
       } catch (err) {
-        console.error('[ekko-agent] model request failed', consolePayload({
-          session_id: context.sessionId,
-          provider: client.provider,
-          request_style: client.requestStyle,
-          error: errorPayload(err),
-        }))
         if (context.fallback && context.fallback.providerConfig.requestStyle !== context.providerConfig.requestStyle && shouldFallbackProtocol(err)) {
-          const fallbackRequest = requestForProvider(request, context.fallback.providerConfig)
-          console.warn('[ekko-agent] model request protocol fallback', consolePayload({
-            session_id: context.sessionId,
-            from_request_style: context.providerConfig.requestStyle,
-            to_request_style: context.fallback.providerConfig.requestStyle,
-            provider_config: redactProviderConfig(context.fallback.providerConfig),
-            request: modelRequestDebugInfo(fallbackRequest),
-          }))
           try {
-            const response = await context.fallback.client.create(fallbackRequest)
-            console.log('[ekko-agent] model request fallback success', consolePayload({
-              session_id: context.sessionId,
-              provider: context.fallback.client.provider,
-              request_style: context.fallback.client.requestStyle,
-              response,
-            }))
-            return response
-          } catch (fallbackErr) {
-            console.error('[ekko-agent] model request fallback failed', consolePayload({
-              session_id: context.sessionId,
-              provider: context.fallback.client.provider,
-              request_style: context.fallback.client.requestStyle,
-              error: errorPayload(fallbackErr),
-            }))
-          }
+            return await context.fallback.client.create(request)
+          } catch {}
         }
         throw err
       }
     },
     async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
-      const providerRequest = requestForProvider(request, context.providerConfig)
-      console.log('[ekko-agent] model stream request', consolePayload({
-        session_id: context.sessionId,
-        provider_config: redactProviderConfig(context.providerConfig),
-        request: modelRequestDebugInfo(providerRequest),
-      }))
       try {
-        for await (const event of client.stream(providerRequest)) {
+        for await (const event of client.stream(request)) {
           yield event
         }
-        console.log('[ekko-agent] model stream success', consolePayload({
-          session_id: context.sessionId,
-          provider: client.provider,
-          request_style: client.requestStyle,
-        }))
       } catch (err) {
-        console.error('[ekko-agent] model stream failed', consolePayload({
-          session_id: context.sessionId,
-          provider: client.provider,
-          request_style: client.requestStyle,
-          error: errorPayload(err),
-        }))
         if (context.fallback && context.fallback.providerConfig.requestStyle !== context.providerConfig.requestStyle && shouldFallbackProtocol(err)) {
-          const fallbackRequest = requestForProvider(request, context.fallback.providerConfig)
-          console.warn('[ekko-agent] model stream protocol fallback', consolePayload({
-            session_id: context.sessionId,
-            from_request_style: context.providerConfig.requestStyle,
-            to_request_style: context.fallback.providerConfig.requestStyle,
-            provider_config: redactProviderConfig(context.fallback.providerConfig),
-            request: modelRequestDebugInfo(fallbackRequest),
-          }))
           try {
-            for await (const event of context.fallback.client.stream(fallbackRequest)) {
+            for await (const event of context.fallback.client.stream(request)) {
               yield event
             }
-            console.log('[ekko-agent] model stream fallback success', consolePayload({
-              session_id: context.sessionId,
-              provider: context.fallback.client.provider,
-              request_style: context.fallback.client.requestStyle,
-            }))
             return
-          } catch (fallbackErr) {
-            console.error('[ekko-agent] model stream fallback failed', consolePayload({
-              session_id: context.sessionId,
-              provider: context.fallback.client.provider,
-              request_style: context.fallback.client.requestStyle,
-              error: errorPayload(fallbackErr),
-            }))
-          }
+          } catch {}
         }
         throw err
       }
@@ -529,7 +406,11 @@ export async function handleEkkoAgentRun(
   state.isWorking = true
   state.isAborting = false
   state.profile = profile
-  state.source = data.source === 'workflow' ? 'workflow' : 'coding_agent'
+  state.source = data.session_source === 'group_chat' || data.source === 'group_chat'
+    ? 'group_chat'
+    : data.session_source === 'workflow' || data.source === 'workflow'
+      ? 'workflow'
+      : 'coding_agent'
   state.events = []
   const abortController = new AbortController()
   state.abortController = abortController
@@ -551,6 +432,7 @@ export async function handleEkkoAgentRun(
   const runtimeConfig = await resolveEkkoProviderRuntimeConfig({
     profile,
     provider: modelConfig.provider,
+    model: modelConfig.model,
     baseUrl: data.baseUrl || data.base_url,
     apiKey: data.apiKey || data.api_key,
     apiMode: requestedApiMode || storedApiMode,
@@ -559,7 +441,8 @@ export async function handleEkkoAgentRun(
   const apiMode = runtimeConfig.apiMode
   const apiKey = runtimeConfig.apiKey
   const reasoningEffort = resolveReasoningEffort(data.reasoning_effort)
-  const workspace = data.workspace || storedSession?.workspace || getProfileDir(profile)
+  const agent = getGlobalEkkoAgent(profile)
+  const workspace = data.workspace || storedSession?.workspace || agent.sessionWorkspaceDirectory(sessionId)
   const shouldEmitWorkspaceUpdate = Boolean(workspace && !storedSession?.workspace)
   if (storedSession && !storedSession.workspace) updateSession(sessionId, { workspace })
   const displayInput = data.display_input === undefined ? data.input : data.display_input
@@ -568,6 +451,17 @@ export async function handleEkkoAgentRun(
   const storageText = data.storage_message !== undefined ? data.storage_message : displayText
   const shouldPersistUserMessage = !skipUserMessage && displayInput !== null
   const now = Math.floor(Date.now() / 1000)
+  const instructions = String(data.instructions || '').trim()
+  const instructionMessages: AgentMessage[] = instructions
+    ? [{ role: 'system', content: instructions }]
+    : []
+  const sessionSource = data.session_source === 'global_agent'
+    ? 'global_agent'
+    : data.session_source === 'group_chat' || data.source === 'group_chat'
+      ? 'group_chat'
+      : data.session_source === 'workflow' || data.source === 'workflow'
+        ? 'workflow'
+        : 'coding_agent'
   const emit = (event: string, payload: any) => {
     const tagged = { ...payload, session_id: sessionId }
     observeRunChatPetEvent(profile, event, tagged)
@@ -585,7 +479,7 @@ export async function handleEkkoAgentRun(
     createSession({
       id: sessionId,
       profile,
-      source: 'coding_agent',
+      source: sessionSource,
       agent: 'ekko-agent',
       agent_mode: 'scoped',
       model: modelConfig.model,
@@ -594,6 +488,20 @@ export async function handleEkkoAgentRun(
       title,
       workspace,
       category_id: data.category_id,
+    })
+  } else if (
+    storedSession.source !== sessionSource ||
+    storedSession.agent !== 'ekko-agent' ||
+    storedSession.agent_mode !== 'scoped' ||
+    storedSession.agent_session_id ||
+    storedSession.agent_native_session_id
+  ) {
+    updateSession(sessionId, {
+      source: sessionSource,
+      agent: 'ekko-agent',
+      agent_mode: 'scoped',
+      agent_session_id: '',
+      agent_native_session_id: '',
     })
   }
   if (storedSession && apiMode && storedSession.api_mode !== apiMode) {
@@ -624,6 +532,15 @@ export async function handleEkkoAgentRun(
       content: storageText,
       timestamp: now,
     })
+    data.onEvent?.('message.created', {
+      event: 'message.created',
+      session_id: sessionId,
+      queue_id: data.queue_id,
+      message_id: messageId,
+      role,
+      content: displayText,
+      timestamp: now,
+    })
     state.messages.push({
       id: data.queue_id || messageId || state.messages.length + 1,
       session_id: sessionId,
@@ -652,11 +569,10 @@ export async function handleEkkoAgentRun(
     apiKey,
     model: modelConfig.model,
     apiMode,
-    timeoutMs: 120_000,
+    timeoutMs: DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
   })
   const mcpServers = resolveEkkoMcpServers(profile, data.mcpServers || data.mcp_servers)
-  const modelClient = createConsoleModelClient(createModelClient(providerConfig), {
-    sessionId,
+  const modelClient = createProviderModelClient(createModelClient(providerConfig), {
     providerConfig,
     fallback: fallbackProviderConfig
       ? {
@@ -665,7 +581,6 @@ export async function handleEkkoAgentRun(
         }
       : undefined,
   })
-  const agent = getGlobalEkkoAgent(profile)
   const memoryUsageBatchId = randomUUID()
   const skillReviewUsageBatchId = randomUUID()
   const turnId = randomUUID()
@@ -675,19 +590,57 @@ export async function handleEkkoAgentRun(
 
   let assistantText = ''
   let assistantReasoning = ''
+  let assistantMessageId: string | null = null
   let runId = ''
+  let workspaceDiffRunId = ''
+  let workspaceDiffCompleted = false
   let usageInput = 0
   let usageOutput = 0
   let usageCallIndex = 0
   let contextEstimate: any
   let parentUsagePersisted = false
-  const modelStepStartedAt = new Map<number, number>()
   const pendingToolGroups = new Map<string, PendingToolGroup>()
   const toolCallGroupKeys = new Map<string, string>()
   const persistedToolCallIds = new Set<string>()
   const streamedSubagentOutput = new Map<string, string>()
   const scheduledBackgroundContinuations = new Set<string>()
   const pendingBackgroundDisplayContent = new Map<string, string>()
+  const startWorkspaceRunDiff = (eventRunId: string) => {
+    if (workspaceDiffRunId) return
+    workspaceDiffRunId = eventRunId
+    try {
+      startWorkspaceRunCheckpoint({
+        sessionId,
+        runId: eventRunId,
+        workspace,
+      })
+    } catch (err) {
+      logger.warn({ err, sessionId, runId: eventRunId }, '[workspace-diff] failed to start ekko-agent run checkpoint')
+    }
+  }
+  const completeWorkspaceRunDiff = () => {
+    if (workspaceDiffCompleted || !workspaceDiffRunId) return null
+    workspaceDiffCompleted = true
+    try {
+      const change = completeWorkspaceRunCheckpoint({
+        sessionId,
+        runId: workspaceDiffRunId,
+        workspace,
+        assistantMessageId,
+      })
+      if (!change) return null
+      emit('workspace.diff.completed', {
+        event: 'workspace.diff.completed',
+        run_id: workspaceDiffRunId,
+        change_id: change.change_id,
+        change,
+      })
+      return change
+    } catch (err) {
+      logger.warn({ err, sessionId, runId: workspaceDiffRunId }, '[workspace-diff] failed to complete ekko-agent run checkpoint')
+      return null
+    }
+  }
   const appendSubagentOutput = (subagentId: string, text: string) => {
     const previous = streamedSubagentOutput.get(subagentId) || ''
     const next = text.startsWith(previous) ? text : `${previous}${text}`
@@ -723,9 +676,11 @@ export async function handleEkkoAgentRun(
       storageMessage: continuationMessage,
       model: modelConfig.model,
       provider: modelConfig.provider,
+      instructions,
       profile,
       workspace,
       source: state.source,
+      sessionSource: data.session_source,
       codingAgentId: 'ekko-agent',
       mode: data.mode,
       baseUrl,
@@ -773,23 +728,6 @@ export async function handleEkkoAgentRun(
       logger.warn(err, '[chat-run-socket] failed to persist Ekko subagent display state for session %s', sessionId)
     }
   }
-  const writeRunLog = (
-    category: EkkoLogCategory,
-    event: string,
-    data?: unknown,
-    level: EkkoLogLevel = 'info',
-    eventRunId = runId,
-  ) => {
-    agent.writeLog({
-      category,
-      event,
-      level,
-      sessionId,
-      runId: eventRunId || undefined,
-      turnId,
-      data,
-    })
-  }
   const toolGroupKey = (eventRunId: string, step: number) => `${eventRunId}:${step}`
   const scopedToolCallId = (eventRunId: string, toolCallId: string) => `${eventRunId}:${toolCallId}`
   const rememberToolGroup = (eventRunId: string, step: number, message: AgentOutputMessage) => {
@@ -811,6 +749,8 @@ export async function handleEkkoAgentRun(
     if (!toolCalls.length || toolCalls.some(call => !group.results.has(call.id))) return false
     const timestamp = Math.floor(Date.now() / 1000)
     const storedToolCalls = toolCalls.map(toStoredToolCall)
+    const reasoningText = agentReasoningText(group.message.reasoning)
+    const reasoningDetails = serializeAgentReasoningDetails(group.message.reasoning)
     const rows = [
       {
         session_id: sessionId,
@@ -819,8 +759,9 @@ export async function handleEkkoAgentRun(
         tool_calls: storedToolCalls,
         timestamp,
         finish_reason: 'tool_calls',
-        reasoning: group.message.reasoning || null,
-        reasoning_content: group.message.reasoning || null,
+        reasoning: reasoningText || null,
+        reasoning_details: reasoningDetails,
+        reasoning_content: reasoningText || null,
       },
       ...toolCalls.map((toolCall) => {
         const completed = group.results.get(toolCall.id)!
@@ -842,6 +783,7 @@ export async function handleEkkoAgentRun(
     ]
     try {
       const ids = addMessages(rows)
+      if (ids[0] != null) assistantMessageId = String(ids[0])
       rows.forEach((row, index) => {
         state.messages.push({
           id: ids[index] || state.messages.length + 1,
@@ -858,11 +800,6 @@ export async function handleEkkoAgentRun(
         }
       }
       pendingToolGroups.delete(toolGroupKey(group.runId, group.step))
-      writeRunLog('run', 'run.tool_group_persisted', {
-        step: group.step,
-        toolCallIds: toolCalls.map(call => call.id),
-        toolNames: toolCalls.map(call => call.name),
-      }, 'debug', group.runId)
       return true
     } catch (err) {
       logger.warn(err, '[chat-run-socket] failed to incrementally persist Ekko tool group for session %s', sessionId)
@@ -882,183 +819,10 @@ export async function handleEkkoAgentRun(
     group.results.set(toolCallId, { toolName, result })
     persistCompletedToolGroup(group)
   }
-  const logRuntimeEvent = (event: AgentRuntimeEvent) => {
-    const eventRunId = event.runId
-    if (event.type === 'model.delta' || event.type === 'model.reasoning') return
-    if (event.type === 'model.started') {
-      modelStepStartedAt.set(event.step, Date.now())
-      writeRunLog('model', event.type, { step: event.step }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'model.retry') {
-      const startedAt = modelStepStartedAt.get(event.step)
-      writeRunLog('model', event.type, {
-        step: event.step,
-        retry: event.retry,
-        maxRetries: event.maxRetries,
-        durationMs: startedAt == null ? undefined : Date.now() - startedAt,
-        error: event.error,
-      }, 'warn', eventRunId)
-      modelStepStartedAt.set(event.step, Date.now())
-      return
-    }
-    if (event.type === 'model.message') {
-      const startedAt = modelStepStartedAt.get(event.step)
-      modelStepStartedAt.delete(event.step)
-      writeRunLog('model', event.type, {
-        step: event.step,
-        durationMs: startedAt == null ? undefined : Date.now() - startedAt,
-        id: event.message.id,
-        model: event.message.model,
-        finishReason: event.message.finishReason,
-        contentChars: event.message.content.length,
-        reasoningChars: event.message.reasoning?.length || 0,
-        toolCalls: event.message.toolCalls?.map(call => ({
-          id: call.id,
-          name: call.name,
-          arguments: call.arguments,
-        })) || [],
-      }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'model.tool_call') {
-      writeRunLog('model', event.type, {
-        step: event.step,
-        toolCall: {
-          id: event.toolCall.id,
-          name: event.toolCall.name,
-          arguments: event.toolCall.arguments,
-        },
-      }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'model.usage') {
-      writeRunLog('model', event.type, { step: event.step, usage: event.usage }, 'debug', eventRunId)
-      return
-    }
-    if (event.type === 'model.context') {
-      writeRunLog('context', event.type, { step: event.step, context: event.context }, 'debug', eventRunId)
-      return
-    }
-    if (event.type === 'context.estimated') {
-      writeRunLog('context', event.type, { step: event.step, estimate: event.estimate }, 'debug', eventRunId)
-      return
-    }
-    if (event.type === 'tool.started') {
-      writeRunLog(toolLogCategory(event.toolName), event.type, {
-        step: event.step,
-        toolCallId: event.toolCallId,
-        toolName: event.toolName,
-        arguments: event.arguments,
-      }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'tool.completed' || event.type === 'tool.failed') {
-      writeRunLog(toolLogCategory(event.toolName), event.type, {
-        step: event.step,
-        toolCallId: event.toolCallId,
-        toolName: event.toolName,
-        durationMs: event.durationMs,
-        ok: event.result.ok,
-        error: event.result.error,
-        contentChars: event.result.content.length,
-        contentPreview: logPreview(event.result.content),
-      }, event.type === 'tool.failed' ? 'warn' : 'info', eventRunId)
-      return
-    }
-    if (event.type === 'memory.retrieved') {
-      writeRunLog('memory', event.type, {
-        diagnostics: event.diagnostics,
-        memoryIds: event.memoryIds,
-      }, 'debug', eventRunId)
-      return
-    }
-    if (
-      event.type === 'skill.review.started' ||
-      event.type === 'skill.review.completed' ||
-      event.type === 'skill.review.failed'
-    ) {
-      writeRunLog('skill', event.type, {
-        reviewId: event.reviewId,
-        ...('mutations' in event ? { mutations: event.mutations } : {}),
-        ...('error' in event ? { error: event.error } : {}),
-      }, event.type === 'skill.review.failed' ? 'warn' : 'info', eventRunId)
-      return
-    }
-    if (
-      event.type === 'subagent.start' ||
-      event.type === 'subagent.text' ||
-      event.type === 'subagent.thinking' ||
-      event.type === 'subagent.tool' ||
-      event.type === 'subagent.complete'
-    ) {
-      writeRunLog('run', event.type, {
-        subagentId: event.subagentId,
-        ...('childRunId' in event ? { childRunId: event.childRunId } : {}),
-        goal: event.goal,
-        background: event.background,
-        ...('text' in event ? { textChars: event.text.length, textPreview: logPreview(event.text) } : {}),
-        ...('toolName' in event ? {
-          toolName: event.toolName,
-          arguments: event.arguments,
-          toolCount: event.toolCount,
-        } : {}),
-        ...('status' in event ? {
-          status: event.status,
-          summary: event.summary,
-          durationMs: event.durationMs,
-          toolCount: event.toolCount,
-          apiCalls: event.apiCalls,
-          inputTokens: event.inputTokens,
-          outputTokens: event.outputTokens,
-          cacheReadTokens: event.cacheReadTokens,
-          cacheWriteTokens: event.cacheWriteTokens,
-          reasoningTokens: event.reasoningTokens,
-        } : {}),
-      }, event.type === 'subagent.complete' && event.status !== 'completed' ? 'warn' : 'info', eventRunId)
-      return
-    }
-    if (event.type === 'run.started') {
-      writeRunLog('run', event.type, { maxSteps: event.maxSteps }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'run.completed') {
-      writeRunLog('run', event.type, {
-        steps: event.steps,
-        finishReason: event.output.finishReason,
-        outputChars: event.output.content.length,
-        outputPreview: logPreview(event.output.content),
-        contextEstimate: event.contextEstimate,
-      }, 'info', eventRunId)
-      return
-    }
-    if (event.type === 'run.failed') {
-      writeRunLog('run', event.type, { steps: event.steps, error: event.error }, 'error', eventRunId)
-      return
-    }
-    if (event.type === 'run.tool_failure_limit') {
-      writeRunLog('run', event.type, { failures: event.failures }, 'warn', eventRunId)
-      return
-    }
-    if (event.type === 'run.max_steps') {
-      writeRunLog('run', event.type, { maxSteps: event.maxSteps }, 'warn', eventRunId)
-    }
-  }
-  writeRunLog('run', 'run.requested', {
-    model: modelConfig.model,
-    provider: modelConfig.provider,
-    requestStyle: providerConfig.requestStyle,
-    workspace,
-    inputChars: inputText.length,
-    currentInputTokens,
-    queueId: data.queue_id,
-    reasoningEffort,
-    reasoningSummary: 'auto',
-  })
   const handleRuntimeEvent = (event: AgentRuntimeEvent) => {
     if ('runId' in event) runId = event.runId
-    logRuntimeEvent(event)
     if (event.type === 'run.started') {
+      startWorkspaceRunDiff(event.runId)
       state.runId = event.runId
       emit('run.started', {
         event: 'run.started',
@@ -1396,6 +1160,56 @@ export async function handleEkkoAgentRun(
       mcpServers,
       timeoutMs: 120_000,
       signal: abortController.signal,
+      requestToolApproval: (request: AgentToolApprovalRequest) => waitForEkkoToolApproval(request, {
+        sessionId,
+        signal: abortController.signal,
+        onRequested: pending => {
+          emit('approval.requested', {
+            event: 'approval.requested',
+            run_id: runId || turnId,
+            approval_id: pending.approvalId,
+            command: pending.command,
+            description: pending.description,
+            choices: pending.choices,
+            allow_permanent: pending.allowPermanent,
+            timeout_ms: pending.timeoutMs,
+            tool: pending.toolName,
+            permission_key: pending.key,
+          })
+        },
+        onResolved: choice => {
+          emit('approval.resolved', {
+            event: 'approval.resolved',
+            run_id: runId || turnId,
+            approval_id: request.approvalId,
+            choice,
+            resolved: true,
+          })
+        },
+      }),
+      requestUserClarification: (request: AgentClarificationRequest) => waitForEkkoClarification(request, {
+        sessionId,
+        signal: abortController.signal,
+        onRequested: pending => {
+          emit('clarify.requested', {
+            event: 'clarify.requested',
+            run_id: runId || turnId,
+            clarify_id: pending.clarifyId,
+            question: pending.question,
+            choices: pending.choices || null,
+            timeout_ms: pending.timeoutMs,
+          })
+        },
+        onResolved: resolution => {
+          emit('clarify.resolved', {
+            event: 'clarify.resolved',
+            run_id: runId || turnId,
+            clarify_id: request.clarifyId,
+            resolved: resolution.reason === 'response',
+            reason: resolution.reason,
+          })
+        },
+      }),
     }
     const metadata = {
       session_id: sessionId,
@@ -1404,7 +1218,7 @@ export async function handleEkkoAgentRun(
       profile,
     }
     let fixedContextEstimate: Promise<number> | undefined
-    const compressedHistory = await buildCompressedHistory(
+    const compressedHistory = data.context_compression_enabled === false ? [] : await buildCompressedHistory(
       sessionId,
       profile,
       baseUrl,
@@ -1421,22 +1235,18 @@ export async function handleEkkoAgentRun(
           modelClient,
           model: modelConfig.model,
           modelDefaults: { model: modelConfig.model },
-          messages: [],
+          messages: instructionMessages,
           signal: abortController.signal,
           memoryEnabled: false,
           toolContext,
           metadata,
+          backgroundDelegationEnabled: data.background_delegation_enabled !== false,
         }).then(estimate => estimate.contextTokens)
         return (await fixedContextEstimate) + localMessageTokens
       },
       currentInputTokens,
       shouldPersistUserMessage && data.display_role !== 'command',
     )
-    writeRunLog('context', 'context.history_prepared', {
-      historyMessages: compressedHistory.length,
-      currentInputTokens,
-      contextTokens: contextEstimate?.contextTokens,
-    }, 'debug')
     const currentMessage: AgentMessage = {
       role: 'user',
       ...await toUserAgentContent(data.input),
@@ -1452,13 +1262,18 @@ export async function handleEkkoAgentRun(
         reasoningSummary: 'auto',
       },
       messages: [
+        ...instructionMessages,
         ...await toAgentMessages(compressedHistory),
         currentMessage,
       ],
       signal: abortController.signal,
+      logContext: {
+        profile,
+        sessionId,
+        turnId,
+      },
       onEvent: handleRuntimeEvent,
       onMemoryUsage: event => {
-        writeRunLog('memory', 'memory.model_usage', event, 'debug')
         recordSessionUsage({
           sessionId,
           runId: `memory-summary:${memoryUsageBatchId}:call:${event.callIndex}`,
@@ -1475,7 +1290,6 @@ export async function handleEkkoAgentRun(
         })
       },
       onSkillReviewUsage: event => {
-        writeRunLog('skill', 'skill.review.model_usage', event, 'debug')
         recordSessionUsage({
           sessionId,
           runId: `skill-review:${skillReviewUsageBatchId}:call:${event.callIndex}`,
@@ -1493,6 +1307,7 @@ export async function handleEkkoAgentRun(
       },
       toolContext,
       metadata,
+      backgroundDelegationEnabled: data.background_delegation_enabled !== false,
     })
     assistantText = result.output.content || assistantText
     const outputUsage = result.output.usage
@@ -1506,6 +1321,8 @@ export async function handleEkkoAgentRun(
         if (!unpersistedToolCalls.length) continue
         const toolCalls = unpersistedToolCalls.map(toStoredToolCall)
         const timestamp = Math.floor(Date.now() / 1000)
+        const reasoningText = agentReasoningText(step.message.reasoning)
+        const reasoningDetails = serializeAgentReasoningDetails(step.message.reasoning)
         const assistantId = addMessage({
           session_id: sessionId,
           role: 'assistant',
@@ -1513,9 +1330,11 @@ export async function handleEkkoAgentRun(
           tool_calls: toolCalls,
           timestamp,
           finish_reason: 'tool_calls',
-          reasoning: step.message.reasoning || null,
-          reasoning_content: step.message.reasoning || null,
+          reasoning: reasoningText || null,
+          reasoning_details: reasoningDetails,
+          reasoning_content: reasoningText || null,
         })
+        if (assistantId != null) assistantMessageId = String(assistantId)
         state.messages.push({
           id: assistantId || state.messages.length + 1,
           session_id: sessionId,
@@ -1524,8 +1343,9 @@ export async function handleEkkoAgentRun(
           tool_calls: toolCalls,
           timestamp,
           finish_reason: 'tool_calls',
-          reasoning: step.message.reasoning || null,
-          reasoning_content: step.message.reasoning || null,
+          reasoning: reasoningText || null,
+          reasoning_details: reasoningDetails,
+          reasoning_content: reasoningText || null,
         })
       } else if (step.type === 'tool') {
         if (persistedToolCallIds.has(step.toolCallId)) continue
@@ -1551,11 +1371,11 @@ export async function handleEkkoAgentRun(
         })
       }
     }
-    assistantReasoning = result.output.reasoning || assistantReasoning
+    assistantReasoning = agentReasoningText(result.output.reasoning) || assistantReasoning
     const hadToolActivity = result.steps.some(step => step.type === 'tool')
-    if (!assistantText.trim() && !assistantReasoning.trim() && !hadToolActivity) {
+    const boundaryInterrupted = result.output.finishReason === 'boundary_interrupt'
+    if (!boundaryInterrupted && !assistantText.trim() && !assistantReasoning.trim() && !hadToolActivity) {
       const error = 'Model provider returned an empty response after streaming and non-streaming attempts.'
-      writeRunLog('run', 'run.empty_response', { error }, 'error', result.runId)
       logger.warn({
         session_id: sessionId,
         provider_config: redactProviderConfig(providerConfig),
@@ -1580,10 +1400,12 @@ export async function handleEkkoAgentRun(
         queue_id: data.queue_id,
         autonomous: data.autonomous === true,
         delegation_id: data.background_delegation_id,
+        workspace_run_change: completeWorkspaceRunDiff(),
       })
       return
     }
     if (assistantText.trim() || assistantReasoning.trim()) {
+      const reasoningDetails = serializeAgentReasoningDetails(result.output.reasoning)
       const assistantId = addMessage({
         session_id: sessionId,
         role: 'assistant',
@@ -1591,8 +1413,10 @@ export async function handleEkkoAgentRun(
         timestamp: Math.floor(Date.now() / 1000),
         finish_reason: result.output.finishReason || null,
         reasoning: assistantReasoning || null,
+        reasoning_details: reasoningDetails,
         reasoning_content: assistantReasoning || null,
       })
+      if (assistantId != null) assistantMessageId = String(assistantId)
       state.messages.push({
         id: assistantId || state.messages.length + 1,
         session_id: sessionId,
@@ -1601,6 +1425,7 @@ export async function handleEkkoAgentRun(
         timestamp: Math.floor(Date.now() / 1000),
         finish_reason: result.output.finishReason || null,
         reasoning: assistantReasoning || null,
+        reasoning_details: reasoningDetails,
         reasoning_content: assistantReasoning || null,
       })
     }
@@ -1636,9 +1461,11 @@ export async function handleEkkoAgentRun(
       contextTokens: contextEstimate?.contextTokens ?? state.contextTokens,
       context_tokens: contextEstimate?.contextTokens ?? state.contextTokens,
     })
+    const workspaceRunChange = completeWorkspaceRunDiff()
     emit('run.completed', {
       event: 'run.completed',
       run_id: runId || result.runId,
+      message_id: assistantMessageId || undefined,
       output: assistantText,
       context: result.context,
       contextTokens: contextEstimate?.contextTokens,
@@ -1654,23 +1481,15 @@ export async function handleEkkoAgentRun(
       queue_id: data.queue_id,
       autonomous: data.autonomous === true,
       delegation_id: data.background_delegation_id,
+      workspace_run_change: workspaceRunChange,
     })
-    writeRunLog('run', 'run.persisted', {
-      inputTokens: usageInput,
-      outputTokens: usageOutput,
-      contextTokens: contextEstimate?.contextTokens,
-      queueRemaining: state.queue.length,
-    }, 'info', result.runId)
   } catch (err) {
     if (abortController.signal.aborted || isAbortError(err)) {
-      writeRunLog('run', 'run.aborted', {
-        error: err instanceof Error ? err.message : String(err),
-      }, 'warn')
       logger.info('[chat-run-socket] ekko-agent run aborted for session %s', sessionId)
+      completeWorkspaceRunDiff()
       return
     }
     const error = err instanceof Error ? err.message : String(err)
-    writeRunLog('run', 'run.handler_failed', { error, exception: err }, 'error')
     logger.warn(err, '[chat-run-socket] ekko-agent run failed for session %s', sessionId)
     if (state.queue.length === 0) {
       try {
@@ -1691,12 +1510,9 @@ export async function handleEkkoAgentRun(
       queue_id: data.queue_id,
       autonomous: data.autonomous === true,
       delegation_id: data.background_delegation_id,
+      workspace_run_change: completeWorkspaceRunDiff(),
     })
   } finally {
-    writeRunLog('run', 'run.released', {
-      aborted: abortController.signal.aborted,
-      queueRemaining: state.queue.length,
-    }, 'debug')
     if (!abortController.signal.aborted || state.abortController === abortController) {
       state.isWorking = false
       state.isAborting = false
@@ -1715,16 +1531,4 @@ export async function handleEkkoAgentRun(
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === 'AbortError' || error.message === 'Run aborted.')
-}
-
-function logPreview(value: string, maxChars = 4_000): string {
-  return value.length <= maxChars
-    ? value
-    : `${value.slice(0, maxChars)}…[truncated ${value.length - maxChars} chars]`
-}
-
-function toolLogCategory(toolName: string): EkkoLogCategory {
-  if (toolName.startsWith('skill_')) return 'skill'
-  if (toolName.startsWith('memory_')) return 'memory'
-  return 'tool'
 }

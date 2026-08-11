@@ -88,6 +88,24 @@ describe('user auth tables and middleware', () => {
     expect(auth.parseJwtExpirySeconds(value)).toBe(seconds)
   })
 
+  it('allows configuring the model-run JWT lifetime independently', async () => {
+    vi.stubEnv('HERMES_WEB_UI_MODEL_RUN_JWT_EXPIRES_IN', '12h')
+    const { auth } = await initUsers()
+    vi.setSystemTime(new Date('2026-06-30T00:00:00Z'))
+
+    const token = await auth.issueModelRunJwt({ id: 1, username: 'admin', role: 'super_admin' })
+    const payload = jwtPayload(token)
+
+    expect(payload.exp - payload.iat).toBe(12 * 60 * 60)
+  })
+
+  it('falls back to the one-hour model-run JWT lifetime for invalid overrides', async () => {
+    vi.stubEnv('HERMES_WEB_UI_MODEL_RUN_JWT_EXPIRES_IN', 'forever')
+    const { auth } = await initUsers()
+
+    expect(auth.getModelRunJwtExpiresSeconds()).toBe(60 * 60)
+  })
+
   it('creates the default super admin without profile bindings', async () => {
     const { schemas, users } = await initUsers()
 
@@ -192,7 +210,9 @@ describe('user auth tables and middleware', () => {
   it.each([
     '/api/hermes/media/apikey-image-generate',
     '/api/hermes/media/grok-image-to-video',
-  ])('still allows server token for local media agent endpoint %s', async (path) => {
+    '/api/hermes/voice/proxy/default/v1/tts',
+    '/api/hermes/voice/proxy/work/v1/audio/transcriptions',
+  ])('allows server token for an approved loopback agent endpoint %s', async (path) => {
     vi.stubEnv('AUTH_TOKEN', 'server-token')
     const { auth } = await initUsers()
     const ctx = {
@@ -217,6 +237,8 @@ describe('user auth tables and middleware', () => {
   it.each([
     '/api/hermes/media/apikey-image-generate',
     '/api/hermes/media/grok-image-to-video',
+    '/api/hermes/voice/proxy/default/v1/tts',
+    '/api/hermes/voice/proxy/work/v1/audio/transcriptions',
     '/api/devices',
     '/api/devices/scan',
     '/api/devices/device-1/connect',
@@ -441,6 +463,14 @@ describe('user auth tables and middleware', () => {
 
     expect(ctx.status).toBe(200)
     expect(ctx.body.token).toMatch(/^[^.]+\.[^.]+\.[^.]+$/)
+    expect(ctx.body.userId).toBeGreaterThan(0)
+    expect(ctx.body.theme).toEqual({
+      fontSize: 14,
+      textColor: null,
+      accentColor: null,
+      background: null,
+      updatedAt: 0,
+    })
   })
 
   it('marks only admin with password 123456 as requiring a credential change', async () => {

@@ -9,21 +9,88 @@ export interface RoomInfo {
     name: string
     inviteCode: string | null
     canManage?: boolean
-    triggerTokens?: number
-    maxHistoryTokens?: number
-    tailMessageCount?: number
+    canMentionAll?: boolean
+    ownerMemberId?: string
+    summaryProfile: string
+    summaryProvider: string
+    summaryModel: string
+    summaryApiMode: string
+    summaryEveryTurns: number
     totalTokens?: number
     workspace: string
+    allowGuestAgents?: number
+    guestAgentApproval?: 'owner'
+    maxGuestAgentsPerMember?: number
+    allowRemoteWorkspaceAccess?: number
+    createdAt?: number
+    lastActiveAt?: number
+}
+
+export interface RoomSummaryConfig {
+    summaryProfile: string
+    summaryProvider: string
+    summaryModel: string
+    summaryApiMode: string
+    summaryEveryTurns: number
+}
+
+export interface RoomConfigInput extends Partial<RoomSummaryConfig> {
+    name?: string
+}
+
+export interface RoomSummaryState {
+    roomId: string
+    summary: string
+    summaryThroughMessageId: string
+    summaryThroughMessageTimestamp: number
+    summarizedTurnCount: number
+    status: 'idle' | 'summarizing' | 'success' | 'failed'
+    version: number
+    updatedAt: number
+    lastError: string | null
+}
+
+export interface RoomSummaryAnchor {
+    id: string
+    timestamp: number
+    senderName: string
+    role?: string
+    content: string
 }
 
 export interface RoomAgent {
     id: string
     roomId: string
     agentId: string
+    agent: 'hermes' | 'ekko' | 'codex' | 'claude'
     profile: string
+    provider: string
+    model: string
+    apiMode: string
+    reasoningEffort: string
     name: string
     description: string
+    avatar: string
     invited: number
+    executorType?: 'server' | 'remote'
+    remoteOrigin?: string
+    connectionStatus?: 'online' | 'offline'
+    ownerMemberId?: string
+    connectorId?: string
+    historical?: boolean
+}
+
+export interface RoomAgentInput {
+    agent: 'hermes' | 'ekko' | 'codex' | 'claude'
+    profile: string
+    provider?: string
+    model?: string
+    apiMode?: string
+    reasoningEffort?: string
+    name?: string
+    description?: string
+    avatar?: string
+    invited?: boolean
 }
 
 export interface AgentAddResult {
@@ -40,8 +107,20 @@ export interface ChatMessage {
     roomId: string
     senderId: string
     senderName: string
+    senderType?: 'member' | 'agent'
+    senderAgentRecordId?: string
+    senderAvatar?: string
+    senderAgentType?: RoomAgent['agent']
+    senderAgentProfile?: string
+    senderAgentProvider?: string
+    senderAgentModel?: string
+    senderAgentDescription?: string
+    senderOwnerMemberId?: string
     content: string
     timestamp: number
+    /** Server-assigned persistence time used for room activity ordering. */
+    persistedAt?: number
+    run_id?: string | null
     role?: string
     tool_call_id?: string | null
     tool_calls?: any[] | null
@@ -50,16 +129,24 @@ export interface ChatMessage {
     reasoning?: string | null
     reasoning_details?: string | null
     reasoning_content?: string | null
+    mentions?: GroupChatMention[]
     isStreaming?: boolean
     toolName?: string
     toolCallId?: string
     toolArgs?: unknown
     toolPreview?: string
     toolResult?: unknown
-    toolStatus?: 'running' | 'done' | 'error'
+    toolStatus?: 'running' | 'done' | 'error' | 'interrupted'
     workspaceChanges?: GroupWorkspaceDiffPayload[]
     firstSeenAt?: number
     attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>
+    runItems?: ChatMessage[]
+}
+
+export interface GroupChatMention {
+    type: 'agent' | 'all'
+    participantId?: string
+    displayName: string
 }
 
 export interface GroupWorkspaceDiffFile {
@@ -99,6 +186,7 @@ export interface MemberInfo {
     description: string
     joinedAt: number
     avatar?: string
+    connectionStatus?: 'online' | 'offline'
 }
 
 export interface JoinResult {
@@ -113,10 +201,20 @@ export interface JoinResult {
 
 let socket: ReturnType<typeof io> | null = null
 
-export function connectGroupChat(opts?: { userId?: string; userName?: string; description?: string; authUserId?: number }): ReturnType<typeof io> {
-    if (socket?.connected) return socket
+export function connectGroupChat(opts?: {
+    userId?: string
+    userName?: string
+    description?: string
+    authUserId?: number
+    inviteCode?: string
+}): ReturnType<typeof io> {
+    // Keep one Socket.IO instance while it reconnects. Replacing a disconnected
+    // instance leaves the old reconnection loop alive and can split join/message
+    // events across different socket ids.
+    if (socket) return socket
 
-    const token = getApiKey()
+    const inviteCode = opts?.inviteCode?.trim() || ''
+    const token = inviteCode ? '' : getApiKey()
     const userId = opts?.userId || localStorage.getItem('gc_user_id') || generateUUID()
     if (!opts?.userId) localStorage.setItem('gc_user_id', userId)
 
@@ -127,6 +225,7 @@ export function connectGroupChat(opts?: { userId?: string; userName?: string; de
             name: opts?.userName || localStorage.getItem('gc_user_name') || undefined,
             description: opts?.description || localStorage.getItem('gc_user_description') || undefined,
             authUserId: opts?.authUserId,
+            inviteCode: inviteCode || undefined,
         },
         transports: ['websocket', 'polling'],
         reconnection: true,
@@ -181,8 +280,14 @@ export async function createRoom(data: {
     inviteCode: string
     memberName?: string
     memberDescription?: string
-    agents?: { profile: string; name?: string; description?: string; invited?: boolean }[]
-    compression?: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }
+    agents?: RoomAgentInput[]
+    summary: {
+        profile: string
+        provider: string
+        model: string
+        apiMode: string
+        everyTurns: number
+    }
     workspace?: string
 }): Promise<{ room: RoomInfo; agents: RoomAgent[]; agentResults?: AgentAddResult[] }> {
     return request('/api/hermes/group-chat/rooms', {
@@ -216,7 +321,7 @@ export async function getRoomDetail(
 }
 
 export async function joinRoomByCode(code: string): Promise<{ room: RoomInfo }> {
-    return request(`/api/hermes/group-chat/rooms/join/${code}`)
+    return request(`/api/hermes/group-chat/rooms/join/${encodeURIComponent(code)}`)
 }
 
 export async function updateInviteCode(roomId: string, inviteCode: string): Promise<{ success: boolean }> {
@@ -227,14 +332,17 @@ export async function updateInviteCode(roomId: string, inviteCode: string): Prom
     })
 }
 
-export async function addAgent(roomId: string, data: {
-    profile: string
-    name?: string
-    description?: string
-    invited?: boolean
-}): Promise<{ agent: RoomAgent }> {
+export async function addAgent(roomId: string, data: RoomAgentInput): Promise<{ agent: RoomAgent }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/agents`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    })
+}
+
+export async function updateAgent(roomId: string, agentId: string, data: RoomAgentInput): Promise<{ agent: RoomAgent; agents: RoomAgent[]; members: MemberInfo[] }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/agents/${agentId}`, {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
     })
@@ -246,6 +354,12 @@ export async function listAgents(roomId: string): Promise<{ agents: RoomAgent[] 
 
 export async function removeAgent(roomId: string, agentId: string): Promise<{ success: boolean; agents: RoomAgent[]; members: MemberInfo[] }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/agents/${agentId}`, {
+        method: 'DELETE',
+    })
+}
+
+export async function removeRoomMember(roomId: string, userId: string): Promise<{ success: boolean; agents: RoomAgent[]; members: MemberInfo[] }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/members/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
     })
 }
@@ -262,7 +376,7 @@ export async function clearRoomContext(roomId: string): Promise<{ success: boole
     })
 }
 
-export async function updateRoomConfig(roomId: string, config: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }): Promise<{ room: RoomInfo }> {
+export async function updateRoomConfig(roomId: string, config: RoomConfigInput): Promise<{ room: RoomInfo }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -278,9 +392,15 @@ export async function updateRoomWorkspace(roomId: string, workspace: string): Pr
     })
 }
 
-export async function forceCompress(roomId: string): Promise<{ success: boolean; summary: string }> {
-    return request(`/api/hermes/group-chat/rooms/${roomId}/compress`, {
-        method: 'POST',
+export async function getRoomSummary(roomId: string): Promise<{ summary: RoomSummaryState; anchor: RoomSummaryAnchor | null }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/summary`)
+}
+
+export async function updateRoomSummary(roomId: string, summary: string): Promise<{ summary: RoomSummaryState }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/summary`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary }),
     })
 }
 

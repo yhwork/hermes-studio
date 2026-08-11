@@ -12,7 +12,7 @@ vi.mock('vue-i18n', () => ({
 }))
 
 vi.mock('naive-ui', () => ({
-  NButton: { template: '<button type="button" v-bind="$attrs"><slot /><slot name="icon" /></button>' },
+  NButton: { emits: ['click'], template: '<button type="button" v-bind="$attrs" @click="$emit(\'click\', $event)"><slot /><slot name="icon" /></button>' },
   NTooltip: { template: '<div><slot name="trigger" /><slot /></div>' },
   NSwitch: { template: '<button type="button"></button>' },
   NDropdown: { template: '<div><slot /></div>' },
@@ -85,6 +85,56 @@ describe('GroupChatInput mentions', () => {
     expect(wrapper.find('.mention-dropdown').text()).toContain('@Worker')
   })
 
+  it('inserts an agent mention at the current cursor from the avatar action', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.emitTyping = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      attachTo: document.body,
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+    const textarea = wrapper.get('textarea')
+
+    await textarea.setValue('老板喊你')
+    ;(textarea.element as HTMLTextAreaElement).setSelectionRange(5, 5)
+    ;(wrapper.vm as any).insertMention('codex')
+    await nextTick()
+
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('老板喊你 @codex ')
+    expect(document.activeElement).toBe(textarea.element)
+    expect(store.emitTyping).toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
+  it('uses the avatar agent id when historical agents have the same name', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.agents = [
+      { id: 'row-1', agentId: 'agent-1', profile: 'first', name: 'Alex', roomId: 'room-1', description: '', invited: 1 },
+      { id: 'row-2', agentId: 'agent-2', profile: 'second', name: 'Alex', roomId: 'room-1', description: '', invited: 1 },
+    ]
+    store.emitTyping = vi.fn()
+    const onSend = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      props: { onSend },
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+
+    ;(wrapper.vm as any).insertMention('Alex', 'agent-2')
+    ;(wrapper.vm as any).handleSend()
+
+    expect(onSend).toHaveBeenCalledWith(
+      '@Alex',
+      undefined,
+      [{ type: 'agent', participantId: 'agent-2', displayName: 'Alex' }],
+    )
+  })
+
   it('shows the active room reference outside the input and can cancel it', async () => {
     const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
     const settingsStore = useSettingsStore()
@@ -108,6 +158,153 @@ describe('GroupChatInput mentions', () => {
 
     await wrapper.get('.message-reference-remove').trigger('click')
     expect(store.activeMessageReference).toBeNull()
+  })
+
+  it('automatically mentions a valid quoted agent once', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.currentRoomId = 'room-1'
+    store.userId = 'human-1'
+    store.agents = [{ id: 'row-1', agentId: 'agent-1', profile: 'worker', name: 'Worker', roomId: 'room-1', description: '', invited: 1 }]
+    const onSend = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      props: { onSend },
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+
+    store.setMessageReference('room-1', {
+      id: 'message-1',
+      role: 'assistant',
+      content: 'A referenced response',
+      sender: 'Worker',
+      senderId: 'agent-1',
+    })
+    await nextTick()
+
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('@Worker ')
+    await wrapper.get('textarea').setValue('@Worker please review')
+    ;(wrapper.vm as any).handleSend()
+    expect(onSend).toHaveBeenCalledWith(
+      '@Worker please review',
+      undefined,
+      [{ type: 'agent', participantId: 'agent-1', displayName: 'Worker' }],
+    )
+    store.setMessageReference('room-1', {
+      id: 'message-2',
+      role: 'assistant',
+      content: 'Another response',
+      sender: 'Worker',
+      senderId: 'agent-1',
+    })
+    await nextTick()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('@Worker ')
+  })
+
+  it('clears structured mention metadata when its visible text is deleted', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.currentRoomId = 'room-1'
+    store.userId = 'human-1'
+    store.agents = [{ id: 'row-1', agentId: 'agent-1', profile: 'worker', name: 'Worker', roomId: 'room-1', description: '', invited: 1 }]
+    const onSend = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      props: { onSend },
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+
+    store.setMessageReference('room-1', {
+      id: 'message-1',
+      role: 'assistant',
+      content: 'A referenced response',
+      sender: 'Worker',
+      senderId: 'agent-1',
+    })
+    await nextTick()
+    await wrapper.get('textarea').setValue('please review')
+    ;(wrapper.vm as any).handleSend()
+
+    expect(onSend).toHaveBeenCalledWith('please review', undefined, undefined)
+  })
+
+  it('keeps same-name mention identities independent when one token is deleted', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.currentRoomId = 'room-1'
+    store.userId = 'human-1'
+    store.agents = [
+      { id: 'row-1', agentId: 'agent-1', profile: 'first', name: 'Alex', roomId: 'room-1', description: '', invited: 1 },
+      { id: 'row-2', agentId: 'agent-2', profile: 'second', name: 'Alex', roomId: 'room-1', description: '', invited: 1 },
+    ]
+    const onSend = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      props: { onSend },
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+    store.setMessageReference('room-1', {
+      id: 'first-alex',
+      role: 'assistant',
+      content: 'First',
+      sender: 'Alex',
+      senderId: 'agent-1',
+    })
+    await nextTick()
+    store.setMessageReference('room-1', {
+      id: 'second-alex',
+      role: 'assistant',
+      content: 'Second',
+      sender: 'Alex',
+      senderId: 'agent-2',
+    })
+    await nextTick()
+    const textarea = wrapper.get('textarea')
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('@Alex @Alex ')
+
+    await textarea.setValue('@Alex ')
+    ;(wrapper.vm as any).handleSend()
+
+    expect(onSend).toHaveBeenCalledWith(
+      '@Alex',
+      undefined,
+      [{ type: 'agent', participantId: 'agent-2', displayName: 'Alex' }],
+    )
+  })
+
+  it('does not auto-mention self or an invalid quoted sender', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const store = useGroupChatStore()
+    store.currentRoomId = 'room-1'
+    store.userId = 'human-1'
+    const wrapper = mount(GroupChatInput, {
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+
+    store.setMessageReference('room-1', {
+      id: 'self',
+      role: 'user',
+      content: 'My message',
+      sender: 'Me',
+      senderId: 'human-1',
+    })
+    await nextTick()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+
+    store.setMessageReference('room-1', {
+      id: 'missing',
+      role: 'assistant',
+      content: 'Removed member',
+      sender: 'Removed',
+      senderId: 'removed-1',
+    })
+    await nextTick()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
   })
 
   it('applies the configured desktop input height', async () => {
@@ -160,5 +357,24 @@ describe('GroupChatInput mentions', () => {
     await nextTick()
 
     expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).not.toBe('168px')
+  })
+
+  it('keeps the draft intact when room configuration blocks sending', async () => {
+    const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
+    const settingsStore = useSettingsStore()
+    settingsStore.display = {}
+    const onSendBlocked = vi.fn()
+    const wrapper = mount(GroupChatInput, {
+      props: { sendBlocked: true, onSendBlocked },
+      global: { plugins: [pinia], stubs: { Transition: false } },
+    })
+    const textarea = wrapper.get('textarea')
+
+    await textarea.setValue('@Worker keep this draft')
+    ;(wrapper.vm as any).handleSend()
+
+    expect(onSendBlocked).toHaveBeenCalledOnce()
+    expect(wrapper.emitted('send')).toBeUndefined()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('@Worker keep this draft')
   })
 })

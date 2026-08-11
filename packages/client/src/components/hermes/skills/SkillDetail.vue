@@ -302,8 +302,8 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
 .usage-stats {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
+  gap: 12px;
+  margin-inline-start: auto;
   flex-shrink: 0;
 }
 
@@ -550,7 +550,7 @@ watch(() => `${props.target || 'hermes'}/${props.category}/${props.skill}`, load
 
   .usage-stats {
     flex: 1 1 100%;
-    margin-left: 0;
+    margin-inline-start: 0;
     gap: 8px;
     flex-wrap: wrap;
   }

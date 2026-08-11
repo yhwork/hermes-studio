@@ -25,10 +25,12 @@ import { resetDesktopDefaultLogin } from './desktop-login-reset'
 import { installHermesStudioCliShim, installHermesStudioMcpShim } from './cli-shim'
 import { parseHermesCliArgs, runBundledHermesCli } from './hermes-cli'
 import { installSelectionContextMenu } from './selection-context-menu'
+import { groupChatAgentLinkPopupResponse } from './group-chat-agent-popup'
 import {
   ensureDesktopRuntime,
   isDesktopRuntimeReady,
   migratePendingRuntimeRoot,
+  repairUpdatedDesktopRuntimeLaunchers,
   writeActiveRuntimeVersion,
   type RuntimeDownloadSource,
   type RuntimeProgress,
@@ -465,7 +467,7 @@ async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
-    minWidth: 960,
+    minWidth: 769,
     minHeight: 600,
     title: 'Hermes Studio',
     backgroundColor: '#1a1a1a',
@@ -511,7 +513,9 @@ async function createWindow(): Promise<void> {
   installSelectionContextMenu(mainWindow)
 
   // External links → system browser
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  mainWindow.webContents.setWindowOpenHandler(({ url, frameName }) => {
+    const agentLinkPopup = groupChatAgentLinkPopupResponse(url, frameName)
+    if (agentLinkPopup) return agentLinkPopup
     if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) {
       return { action: 'allow' }
     }
@@ -598,7 +602,9 @@ async function openChatWindow(sessionIdInput: unknown, profileInput?: unknown): 
   })
 
   installSelectionContextMenu(chatWindow)
-  chatWindow.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
+  chatWindow.webContents.setWindowOpenHandler(({ url: targetUrl, frameName }) => {
+    const agentLinkPopup = groupChatAgentLinkPopupResponse(targetUrl, frameName)
+    if (agentLinkPopup) return agentLinkPopup
     if (/^(https?:|mailto:)/i.test(targetUrl)) {
       shell.openExternal(targetUrl).catch(() => undefined)
     }
@@ -860,12 +866,43 @@ function updateSplash(progress: RuntimeProgress) {
   `).catch(() => undefined)
 }
 
+async function installPackagedCommandShims(): Promise<void> {
+  if (!app.isPackaged) return
+
+  const installs = [
+    installHermesStudioCliShim({
+      nodePath: bundledNode(),
+      runtimeVersion: desktopRuntimeVersion(),
+      webUiScriptPath: join(webuiDir(), 'bin', 'hermes-web-ui.mjs'),
+    }),
+    installHermesStudioMcpShim({
+      nodePath: bundledNode(),
+      scriptPath: join(webuiDir(), 'bin', 'hermes-studio-mcp.mjs'),
+      webUiUrl: `http://127.0.0.1:${PORT}`,
+    }),
+  ]
+  const results = await Promise.allSettled(installs)
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.warn(
+        `[cli-shim] failed to install Hermes Studio command: `
+        + `${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+      )
+      continue
+    }
+    if (result.value.status === 'skipped') {
+      console.warn(`[cli-shim] ${result.value.reason}: ${result.value.shimPath}`)
+    }
+  }
+}
+
 async function bootstrap(source?: RuntimeDownloadSource) {
   if (isBootstrapping) return
   isBootstrapping = true
 
   try {
     await migratePendingRuntimeRoot(updateSplash)
+    repairUpdatedDesktopRuntimeLaunchers()
     const selectedSource = source || envRuntimeDownloadSource()
     const runtimeUrlOverride = !!process.env.HERMES_DESKTOP_RUNTIME_URL?.trim()
     const manifestOverride = !!process.env.HERMES_DESKTOP_RUNTIME_MANIFEST_URL?.trim()
@@ -883,6 +920,7 @@ async function bootstrap(source?: RuntimeDownloadSource) {
     }
     if (isDesktopRuntimeReady()) {
       writeActiveRuntimeVersion()
+      await installPackagedCommandShims()
     }
   } catch (err) {
     console.error('Failed to prepare Hermes runtime:', err)
@@ -1087,7 +1125,12 @@ function resolveNotificationIcon(icon: unknown): string {
   return candidates.find(candidate => existsSync(candidate)) || desktopIcon()
 }
 
-ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: unknown; body?: unknown; icon?: unknown; tag?: unknown }) => {
+function safeNotificationClickUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  return value.startsWith('/hermes/') && !value.includes('..') && !value.includes('\\') ? value : null
+}
+
+ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: unknown; body?: unknown; icon?: unknown; tag?: unknown; clickUrl?: unknown }) => {
   const supported = Notification.isSupported()
   if (!supported) {
     console.warn('[desktop-notification] Electron notifications are not supported on this system')
@@ -1099,6 +1142,7 @@ ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: 
     : 'Hermes Studio'
   const body = typeof payload?.body === 'string' ? payload.body.trim().slice(0, 240) : ''
   const icon = resolveNotificationIcon(payload?.icon)
+  const clickUrl = safeNotificationClickUrl(payload?.clickUrl)
   const notification = new Notification({
     title,
     body,
@@ -1111,6 +1155,15 @@ ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: 
   }
   notification.on('click', () => {
     releaseNotification()
+    if (clickUrl && mainWindow && !mainWindow.isDestroyed()) {
+      const target = webUiHashUrl(clickUrl)
+      if (target) {
+        void mainWindow.loadURL(target)
+          .catch(error => console.warn('[desktop-notification] failed to open notification target', error))
+          .finally(showMainWindow)
+      } else showMainWindow()
+      return
+    }
     showMainWindow()
   })
   notification.on('close', releaseNotification)
@@ -1158,30 +1211,6 @@ function runDesktopApp() {
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
     installMicrophonePermissionHandler()
-    if (app.isPackaged) {
-      installHermesStudioCliShim({
-        nodePath: bundledNode(),
-        runtimeVersion: desktopRuntimeVersion(),
-        webUiScriptPath: join(webuiDir(), 'bin', 'hermes-web-ui.mjs'),
-      }).then(result => {
-        if (result.status === 'skipped') {
-          console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
-        }
-      }).catch(err => {
-        console.warn(`[cli-shim] failed to install hermes-studio command: ${err instanceof Error ? err.message : String(err)}`)
-      })
-      installHermesStudioMcpShim({
-        nodePath: bundledNode(),
-        scriptPath: join(webuiDir(), 'bin', 'hermes-studio-mcp.mjs'),
-        webUiUrl: `http://127.0.0.1:${PORT}`,
-      }).then(result => {
-        if (result.status === 'skipped') {
-          console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
-        }
-      }).catch(err => {
-        console.warn(`[cli-shim] failed to install hermes-studio-mcp command: ${err instanceof Error ? err.message : String(err)}`)
-      })
-    }
     createTray()
     await createWindow()
     await initializeDesktopBrowser().catch(error => {

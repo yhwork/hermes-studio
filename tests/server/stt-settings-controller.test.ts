@@ -1,5 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const localModelState = vi.hoisted(() => ({ usable: false, validationError: '' }))
+const localStreamMocks = vi.hoisted(() => ({
+  create: vi.fn(),
+  push: vi.fn(),
+  finish: vi.fn(),
+  cancel: vi.fn(),
+}))
+
+vi.mock('../../packages/server/src/services/hermes/voice-config-sync', () => ({
+  syncVoiceConfigToHermesProfile: vi.fn(async () => ({ stt: 'synced', tts: 'unchanged' })),
+}))
+
+vi.mock('../../packages/server/src/services/hermes/local-stt-model-manager', () => ({
+  LocalSttStreamSessionError: class LocalSttStreamSessionError extends Error {},
+  LOCAL_STT_MODEL_ID: 'test-local-stt-model',
+  getLocalSttModelStatus: () => ({
+    usable: localModelState.usable,
+    validationError: localModelState.validationError,
+  }),
+  transcribeWithLocalStt: vi.fn(),
+  startLocalSttModelDownload: vi.fn(),
+  createLocalSttStreamSession: localStreamMocks.create,
+  pushLocalSttStreamAudio: localStreamMocks.push,
+  finishLocalSttStreamSession: localStreamMocks.finish,
+  cancelLocalSttStreamSession: localStreamMocks.cancel,
+}))
+
 describe('stt settings controller', () => {
   let db: any = null
 
@@ -7,6 +34,12 @@ describe('stt settings controller', () => {
     vi.resetModules()
     const { DatabaseSync } = await import('node:sqlite')
     db = new DatabaseSync(':memory:')
+    localModelState.usable = false
+    localModelState.validationError = ''
+    localStreamMocks.create.mockReset()
+    localStreamMocks.push.mockReset()
+    localStreamMocks.finish.mockReset()
+    localStreamMocks.cancel.mockReset()
     vi.doMock('../../packages/server/src/db/index', () => ({
       getDb: () => db,
       getStoragePath: () => ':memory:',
@@ -275,6 +308,53 @@ describe('stt settings controller', () => {
     await ctrl.listSettings(listCtx)
     expect(listCtx.body).toEqual({ settings: [], activeProvider: 'browser' })
   })
+
+  it('only activates the fixed local STT provider after its model is usable', async () => {
+    const ctrl = await initController()
+    const user = { id: 12, username: 'local-user', role: 'admin' }
+
+    const unavailableCtx = makeCtx(user, { provider: 'local' })
+    await ctrl.saveActiveProvider(unavailableCtx)
+    expect(unavailableCtx.status).toBe(409)
+    expect(unavailableCtx.body).toEqual({ error: 'Local STT model is not installed and usable' })
+
+    localModelState.usable = true
+    const availableCtx = makeCtx(user, { provider: 'local' })
+    await ctrl.saveActiveProvider(availableCtx)
+    expect(availableCtx.body).toEqual({ activeProvider: 'local' })
+
+    const listCtx = makeCtx(user)
+    await ctrl.listSettings(listCtx)
+    expect(listCtx.body).toMatchObject({
+      activeProvider: 'local',
+      settings: [{
+        provider: 'local',
+        settings: { model: 'test-local-stt-model' },
+        secrets: {},
+      }],
+    })
+  })
+
+  it('starts and finishes an authenticated local stream only for the active local profile', async () => {
+    const ctrl = await initController()
+    const user = { id: 12, username: 'local-user', role: 'admin' }
+    localModelState.usable = true
+    await ctrl.saveActiveProvider(makeCtx(user, { provider: 'local' }))
+    localStreamMocks.create.mockResolvedValueOnce({ sessionId: 'stream-1' })
+    localStreamMocks.finish.mockResolvedValueOnce({
+      sessionId: 'stream-1', text: '完成', model: 'test-local-stt-model', durationMs: 2,
+    })
+
+    const startCtx = makeCtx(user)
+    await ctrl.startLocalStream(startCtx)
+    expect(localStreamMocks.create).toHaveBeenCalledWith('12:default')
+    expect(startCtx.body).toEqual({ sessionId: 'stream-1' })
+
+    const finishCtx = makeCtx(user, {}, { sessionId: 'stream-1' })
+    await ctrl.finishLocalStream(finishCtx)
+    expect(localStreamMocks.finish).toHaveBeenCalledWith('stream-1', '12:default', expect.any(AbortSignal))
+    expect(finishCtx.body).toMatchObject({ text: '完成' })
+  })
 })
 
 describe('stt routes', () => {
@@ -296,6 +376,11 @@ describe('stt routes', () => {
     const missingProfileAudio = vi.fn(async (ctx: any) => { ctx.body = { route: 'missingProfileAudio' } })
     const mcuVoiceTurn = vi.fn(async (ctx: any) => { ctx.body = { route: 'mcuVoiceTurn' } })
     const transcribe = vi.fn(async (ctx: any) => { ctx.body = { route: 'transcribe' } })
+    const transcribeVoiceProxy = vi.fn(async (ctx: any) => { ctx.body = { route: 'transcribeVoiceProxy' } })
+    const startLocalStream = vi.fn()
+    const pushLocalStreamChunk = vi.fn()
+    const finishLocalStream = vi.fn()
+    const cancelLocalStream = vi.fn()
 
     vi.doMock('../../packages/server/src/controllers/hermes/stt', () => ({
       listSettings,
@@ -308,6 +393,11 @@ describe('stt routes', () => {
       missingProfileAudio,
       mcuVoiceTurn,
       transcribe,
+      transcribeVoiceProxy,
+      startLocalStream,
+      pushLocalStreamChunk,
+      finishLocalStream,
+      cancelLocalStream,
     }))
 
     const { sttProtectedRoutes } = await import('../../packages/server/src/routes/hermes/stt')
@@ -315,6 +405,9 @@ describe('stt routes', () => {
 
     expect(protectedPaths).toEqual(expect.arrayContaining([
       '/api/hermes/stt/settings',
+      '/api/hermes/stt/local-model',
+      '/api/hermes/stt/local-model/download',
+      '/api/hermes/voice/proxy/:profile/v1/audio/transcriptions',
       '/api/hermes/stt/profile-status',
       '/api/hermes/stt/profile-status/missing-audio',
       '/api/hermes/mcu/voice-turn',
@@ -323,6 +416,10 @@ describe('stt routes', () => {
       '/api/hermes/stt/settings/:provider',
       '/api/hermes/stt/settings/:provider/base-url-preset',
       '/api/hermes/stt/settings/:provider/secret/:secretName',
+      '/api/hermes/stt/local-stream',
+      '/api/hermes/stt/local-stream/:sessionId/chunk',
+      '/api/hermes/stt/local-stream/:sessionId/finish',
+      '/api/hermes/stt/local-stream/:sessionId',
       '/api/hermes/stt/transcribe',
     ]))
 

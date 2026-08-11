@@ -64,7 +64,7 @@ function createEmptyPreset(): MoaPreset {
   return {
     enabled: true,
     reference_models: [],
-    aggregator: { provider: '', model: '' },
+    aggregator: { provider: '', model: '', reasoning_effort: undefined },
     reference_temperature: 0.6,
     aggregator_temperature: 0.4,
     max_tokens: 4096,
@@ -78,6 +78,17 @@ function cloneMoaConfig(config: MoaConfig): MoaConfig {
 function clonePreset(preset: MoaPreset): MoaPreset {
   return JSON.parse(JSON.stringify(preset))
 }
+
+const reasoningEffortOptions = computed(() => [
+  { label: t('chat.reasoningEffort.options.none'), value: 'none' },
+  { label: t('chat.reasoningEffort.options.minimal'), value: 'minimal' },
+  { label: t('chat.reasoningEffort.options.low'), value: 'low' },
+  { label: t('chat.reasoningEffort.options.medium'), value: 'medium' },
+  { label: t('chat.reasoningEffort.options.high'), value: 'high' },
+  { label: t('chat.reasoningEffort.options.xhigh'), value: 'xhigh' },
+  { label: t('chat.reasoningEffort.options.max'), value: 'max' },
+  { label: t('chat.reasoningEffort.options.ultra'), value: 'ultra' },
+])
 
 function slotLabel(slot?: MoaModelSlot): string {
   if (!slot?.provider || !slot?.model) return t('models.combinationNotSet')
@@ -177,10 +188,11 @@ async function saveEditor() {
     ...clonePreset(formPreset.value),
     reference_models: formPreset.value.reference_models
       .filter(slot => slot.provider.trim() && slot.model.trim())
-      .map(slot => ({ provider: slot.provider.trim(), model: slot.model.trim() })),
+      .map(slot => ({ provider: slot.provider.trim(), model: slot.model.trim(), reasoning_effort: slot.reasoning_effort || undefined })),
     aggregator: {
       provider: formPreset.value.aggregator.provider.trim(),
       model: formPreset.value.aggregator.model.trim(),
+      reasoning_effort: formPreset.value.aggregator.reasoning_effort || undefined,
     },
     max_tokens: Math.max(1, Math.floor(Number(formPreset.value.max_tokens) || 4096)),
   }
@@ -362,6 +374,14 @@ watch(() => profilesStore.activeProfileName, () => {
           <div class="slot-editor-list">
             <div v-for="(slot, index) in formPreset.reference_models" :key="index" class="slot-editor-row">
               <span class="slot-pair">{{ slotLabel(slot) }}</span>
+              <NSelect
+                v-model:value="slot.reasoning_effort"
+                :options="reasoningEffortOptions"
+                size="small"
+                clearable
+                :placeholder="t('chat.reasoningEffort.tooltip')"
+                :style="{ width: '130px' }"
+              />
               <span class="slot-row-actions">
                 <NButton size="small" quaternary @click="openModelPicker('reference', index)">
                   {{ t('common.edit') }}
@@ -380,6 +400,14 @@ watch(() => profilesStore.activeProfileName, () => {
           </div>
           <div class="slot-editor-row aggregator-row">
             <span class="slot-pair">{{ slotLabel(formPreset.aggregator) }}</span>
+            <NSelect
+              v-model:value="formPreset.aggregator.reasoning_effort"
+              :options="reasoningEffortOptions"
+              size="small"
+              clearable
+              :placeholder="t('chat.reasoningEffort.tooltip')"
+              :style="{ width: '130px' }"
+            />
             <span class="slot-row-actions">
               <NButton size="small" quaternary @click="openModelPicker('aggregator')">
                 {{ t('common.edit') }}
@@ -563,7 +591,7 @@ watch(() => profilesStore.activeProfileName, () => {
 
 .default-badge {
   display: inline-flex;
-  margin-left: 6px;
+  margin-inline-start: 6px;
   border-radius: 999px;
   padding: 1px 6px;
   background: rgba(var(--accent-primary-rgb), 0.12);
@@ -653,15 +681,11 @@ watch(() => profilesStore.activeProfileName, () => {
 
 .slot-editor-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) 130px auto;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
   border-top: 1px solid $border-light;
-}
-
-.aggregator-row {
-  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .slot-pair {
@@ -732,7 +756,7 @@ watch(() => profilesStore.activeProfileName, () => {
 }
 
 .model-group-items {
-  padding-left: 8px;
+  padding-inline-start: 8px;
 }
 
 .model-item {
@@ -791,7 +815,7 @@ watch(() => profilesStore.activeProfileName, () => {
 .model-badge-custom {
   flex-shrink: 0;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   padding: 1px 5px;
   background: $accent-primary;
   color: #fff;
@@ -821,7 +845,7 @@ watch(() => profilesStore.activeProfileName, () => {
 .model-badge-preview {
   flex-shrink: 0;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   padding: 1px 5px;
   background: #d97706;
   color: #fff;
@@ -834,7 +858,7 @@ watch(() => profilesStore.activeProfileName, () => {
   flex-shrink: 0;
   border: 1px solid $border-color;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   padding: 0 5px;
   background: transparent;
   color: $text-muted;

@@ -25,6 +25,7 @@ import {
   NDrawerContent,
   NDropdown,
   NInput,
+  NInputNumber,
   NModal,
   NSelect,
   NTooltip,
@@ -48,7 +49,7 @@ import SessionListItem from "./SessionListItem.vue";
 import OutlinePanel from "./OutlinePanel.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import SubagentStreamPanel from "./SubagentStreamPanel.vue";
-import { buildVisibleSessionCategoryGroups } from "./session-category-groups";
+import { buildVisibleSessionCategoryGroups, partitionRecentSessions } from "./session-category-groups";
 import PageSidebarNav from "@/components/layout/PageSidebarNav.vue";
 import SettingsCircuitBadge from "@/components/layout/SettingsCircuitBadge.vue";
 import { isStoredSuperAdmin } from "@/api/client";
@@ -99,6 +100,7 @@ let sessionFadeAnimation: Animation | null = null;
 const chatDropCounter = ref(0);
 const isChatDropActive = ref(false);
 const showToolPanel = ref(false);
+const toolPanelTransitionReady = ref(false);
 const activeToolPanel = ref<"files" | "terminal" | "browser">("files");
 const desktopBrowserAvailable = hasDesktopBrowserBridge();
 const desktopChatWindowAvailable = desktopBridge()?.isDesktop === true
@@ -115,7 +117,7 @@ const TOOL_PANEL_MIN_WIDTH = 360;
 const TOOL_PANEL_DEFAULT_WIDTH = 560;
 const TOOL_PANEL_STORAGE_KEY = "hermes.chat.toolPanelWidth";
 const toolPanelWidth = ref(loadToolPanelWidth());
-const toolResizeStart = ref<{ x: number; width: number } | null>(null);
+const toolResizeStart = ref<{ x: number; width: number; deltaSign: 1 | -1 } | null>(null);
 
 const currentMode = ref<"chat" | "live">("chat");
 
@@ -184,9 +186,12 @@ const pageSidebarExpanded = computed(
   () => !props.standalone && currentMode.value === "chat" && showSessions.value,
 );
 let mobileQuery: MediaQueryList | null = null;
-const isMobile = ref(false);
+const isMobile = ref(
+  typeof window !== "undefined" &&
+  window.matchMedia("(max-width: 768px)").matches,
+);
 const toolPanelStyle = computed(() => ({
-  width: isMobile.value ? "100%" : `${toolPanelWidth.value}px`,
+  width: isMobile.value ? "100%" : `min(${toolPanelWidth.value}px, 100%)`,
 }));
 
 function openRealtimeVoice() {
@@ -250,7 +255,7 @@ function handleToolPanelViewportResize() {
 function handleToolResizeMove(event: PointerEvent) {
   const start = toolResizeStart.value;
   if (!start) return;
-  const delta = start.x - event.clientX;
+  const delta = (event.clientX - start.x) * start.deltaSign;
   toolPanelWidth.value = clampToolPanelWidth(start.width + delta);
 }
 
@@ -272,6 +277,7 @@ function startToolResize(event: PointerEvent) {
   toolResizeStart.value = {
     x: event.clientX,
     width: toolPanelWidth.value,
+    deltaSign: document.documentElement.dir === "rtl" ? 1 : -1,
   };
   window.addEventListener("pointermove", handleToolResizeMove);
   window.addEventListener("pointerup", stopToolResize);
@@ -298,6 +304,22 @@ function toggleToolPanel() {
     return;
   }
   showToolPanel.value = true;
+}
+
+function handleToolPanelBeforeEnter() {
+  toolPanelTransitionReady.value = false;
+}
+
+function handleToolPanelAfterEnter() {
+  toolPanelTransitionReady.value = true;
+}
+
+function handleToolPanelBeforeLeave() {
+  toolPanelTransitionReady.value = false;
+}
+
+function handleToolPanelLeaveCancelled() {
+  toolPanelTransitionReady.value = true;
 }
 
 function hasDraggedFiles(event: DragEvent) {
@@ -542,6 +564,8 @@ const sessionCategoriesLoading = ref(false);
 const sessionCategoriesLoaded = ref(false);
 let sessionCategoriesLoadPromise: Promise<void> | null = null;
 const COLLAPSED_CATEGORIES_STORAGE_KEY = "hermes_chat_collapsed_categories";
+const showRecentCountModal = ref(false);
+const recentCountDraft = ref(sessionBrowserPrefsStore.recentCount);
 
 function loadCollapsedCategories(): Set<string> {
   try {
@@ -590,9 +614,17 @@ function sortSessionsForSidebar(items: Session[]): Session[] {
   });
 }
 
+const recentSessionPartition = computed(() => partitionRecentSessions(
+  chatStore.sessions,
+  sessionBrowserPrefsStore.recentCount,
+  t("chat.recent"),
+));
+const recentSessions = computed(() => recentSessionPartition.value.group);
+const nonRecentSessions = computed(() => recentSessionPartition.value.remaining);
+
 const pinnedSessions = computed(() =>
   sortSessionsForSidebar(
-    chatStore.sessions.filter((session) =>
+    nonRecentSessions.value.filter((session) =>
       sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
@@ -600,7 +632,7 @@ const pinnedSessions = computed(() =>
 
 const unpinnedSessions = computed(() =>
   sortSessionsForSidebar(
-    chatStore.sessions.filter(
+    nonRecentSessions.value.filter(
       (session) => !sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
@@ -611,6 +643,17 @@ const categorizedSessions = computed(() => buildVisibleSessionCategoryGroups(
   unpinnedSessions.value,
   t("chat.uncategorized"),
 ));
+
+function openRecentCountModal(event: MouseEvent) {
+  event.stopPropagation();
+  recentCountDraft.value = sessionBrowserPrefsStore.recentCount;
+  showRecentCountModal.value = true;
+}
+
+function saveRecentCount() {
+  sessionBrowserPrefsStore.setRecentCount(recentCountDraft.value);
+  showRecentCountModal.value = false;
+}
 
 watch(
   () => [
@@ -2064,6 +2107,34 @@ async function handleSessionModelCustomSubmit() {
           {{ t("chat.noSessions") }}
         </div>
 
+        <template v-if="recentSessions.sessions.length > 0">
+          <div class="session-group-header session-group-header--static">
+            <span class="session-group-label">{{ recentSessions.label }}</span>
+            <span class="session-group-count">{{ recentSessions.sessions.length }}</span>
+            <button class="session-group-config" type="button" :title="t('chat.recentCount')" @click="openRecentCountModal">⚙</button>
+          </div>
+          <SessionListItem
+            v-for="s in recentSessions.sessions"
+            :key="`recent-${s.id}`"
+            :session="s"
+            :active="s.id === chatStore.activeSessionId"
+            :pinned="sessionBrowserPrefsStore.isPinned(s.id)"
+            :can-delete="s.id !== chatStore.activeSessionId || chatStore.sessions.length > 1"
+            :streaming="chatStore.isSessionLive(s.id)"
+            :completed-unread="chatStore.isSessionCompletedUnread(s.id)"
+            :selectable="isBatchMode"
+            :selected="isSessionSelected(s)"
+            :show-profile="true"
+            :to="sessionHref(s.id)"
+            :intercept-modified-navigation="desktopChatWindowAvailable"
+            @select="handleSessionClick(s.id)"
+            @open-new="openSessionInNewTab(s.id)"
+            @contextmenu="handleContextMenu($event, s.id)"
+            @delete="handleDeleteSession(s.id)"
+            @toggle-select="toggleSessionSelection(s)"
+          />
+        </template>
+
         <template v-if="pinnedSessions.length > 0">
           <div class="session-group-header session-group-header--static">
             <span class="session-group-label">{{ t("chat.pinned") }}</span>
@@ -2175,6 +2246,17 @@ async function handleSessionModelCustomSubmit() {
       @select="handleContextMenuSelect"
       @clickoutside="handleClickOutside"
     />
+
+    <NModal
+      v-model:show="showRecentCountModal"
+      preset="dialog"
+      :title="t('chat.recentCount')"
+      :positive-text="t('common.ok')"
+      :negative-text="t('common.cancel')"
+      @positive-click="saveRecentCount"
+    >
+      <NInputNumber v-model:value="recentCountDraft" :min="1" :max="100" />
+    </NModal>
 
     <NDropdown
       placement="bottom-start"
@@ -2336,28 +2418,6 @@ async function handleSessionModelCustomSubmit() {
         <div v-if="filteredSessionModelGroups.length === 0" class="session-model-empty">
           {{ sessionModelSearch ? 'No results' : 'No models' }}
         </div>
-        <div class="session-model-custom">
-          <div class="session-model-custom-row">
-            <NSelect
-              v-model:value="sessionModelCustomProvider"
-              :options="sessionModelProviderOptions"
-              :disabled="sessionModelSwitching"
-              size="small"
-              class="session-model-custom-provider"
-            />
-            <NInput
-              v-model:value="sessionModelCustomInput"
-              :placeholder="t('models.customModelPlaceholder')"
-              :disabled="sessionModelSwitching"
-              size="small"
-              class="session-model-custom-input"
-              @keydown.enter="handleSessionModelCustomSubmit"
-            />
-          </div>
-          <div class="session-model-custom-hint">
-            {{ t('models.customModelHint') }}
-          </div>
-        </div>
         </div>
         <div v-else class="session-model-list" :aria-busy="sessionModelSwitching">
           <div class="session-model-group-items session-moa-items">
@@ -2393,6 +2453,28 @@ async function handleSessionModelCustomSubmit() {
           </div>
           <div v-if="filteredSessionMoaModels.length === 0" class="session-model-empty">
             {{ t('chat.noMoaPresets') }}
+          </div>
+        </div>
+        <div v-if="sessionModelKind === 'model'" class="session-model-custom">
+          <div class="session-model-custom-row">
+            <NSelect
+              v-model:value="sessionModelCustomProvider"
+              :options="sessionModelProviderOptions"
+              :disabled="sessionModelSwitching"
+              size="small"
+              class="session-model-custom-provider"
+            />
+            <NInput
+              v-model:value="sessionModelCustomInput"
+              :placeholder="t('models.customModelPlaceholder')"
+              :disabled="sessionModelSwitching"
+              size="small"
+              class="session-model-custom-input"
+              @keydown.enter="handleSessionModelCustomSubmit"
+            />
+          </div>
+          <div class="session-model-custom-hint">
+            {{ t('models.customModelHint') }}
           </div>
         </div>
       </NSpin>
@@ -2688,9 +2770,11 @@ async function handleSessionModelCustomSubmit() {
                       fill="none"
                       stroke="currentColor"
                       stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
                     >
-                      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                      <line x1="9" y1="3" x2="9" y2="21" />
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
                       <line x1="15" y1="3" x2="15" y2="21" />
                     </svg>
                   </template>
@@ -2767,6 +2851,7 @@ async function handleSessionModelCustomSubmit() {
             <MessageList
               ref="messageListRef"
               :approval-portal-to-body="showRealtimeVoice"
+              scroll-scope="chat"
             />
             <div class="workspace-bar" v-if="chatStore.activeSession">
               <div class="workspace-bar-row">
@@ -2799,82 +2884,107 @@ async function handleSessionModelCustomSubmit() {
             :messages="chatStore.messages"
             @navigate="handleOutlineNavigate"
           />
-          <aside
-            v-if="showToolPanel"
-            class="chat-tool-panel"
-            :style="toolPanelStyle"
+          <Transition
+            name="tool-panel"
+            @before-enter="handleToolPanelBeforeEnter"
+            @after-enter="handleToolPanelAfterEnter"
+            @before-leave="handleToolPanelBeforeLeave"
+            @leave-cancelled="handleToolPanelLeaveCancelled"
           >
-            <div
-              class="chat-tool-resize-handle"
-              @pointerdown="startToolResize"
-            />
-            <div class="chat-tool-panel-inner">
-              <WorkspaceDiffPreview
-                v-if="toolPanelStore.workspaceDiff"
-                :custom-close="closeToolPanelOverlay"
+            <aside
+              v-if="showToolPanel"
+              class="chat-tool-panel"
+              :style="toolPanelStyle"
+            >
+              <div
+                class="chat-tool-resize-handle"
+                @pointerdown="startToolResize"
               />
-              <FilePreview
-                v-else-if="filesStore.previewFile"
-                :custom-close="closeToolPanelOverlay"
-              />
-              <SubagentStreamPanel
-                v-else-if="selectedSubagent"
-                :stream="selectedSubagentStream"
-                @close="closeToolPanelOverlay"
-              />
-              <template v-else>
-                <div class="chat-tool-tabs" role="tablist">
-                  <button
-                    class="chat-tool-tab"
-                    :class="{ active: activeToolPanel === 'files' }"
-                    type="button"
-                    role="tab"
-                    :aria-selected="activeToolPanel === 'files'"
-                    @click="activeToolPanel = 'files'"
-                  >
-                    {{ t("drawer.files") }}
-                  </button>
-                  <button
-                    class="chat-tool-tab"
-                    :class="{ active: activeToolPanel === 'terminal' }"
-                    type="button"
-                    role="tab"
-                    :aria-selected="activeToolPanel === 'terminal'"
-                    @click="activeToolPanel = 'terminal'"
-                  >
-                    {{ t("drawer.terminal") }}
-                  </button>
-                  <button
-                    v-if="desktopBrowserAvailable"
-                    class="chat-tool-tab"
-                    :class="{ active: activeToolPanel === 'browser' }"
-                    type="button"
-                    role="tab"
-                    :aria-selected="activeToolPanel === 'browser'"
-                    @click="activeToolPanel = 'browser'"
-                  >
-                    {{ t("browser.title") }}
-                  </button>
-                </div>
-                <div class="chat-tool-content">
-                  <FilesPanel
-                    v-show="activeToolPanel === 'files'"
-                    :workspace-session-id="activeWorkspaceSessionId"
-                    :workspace="activeWorkspacePath"
-                    @attach="handleWorkspaceFileAttach"
-                  />
-                  <TerminalPanel
-                    v-show="activeToolPanel === 'terminal'"
-                    :visible="showToolPanel && activeToolPanel === 'terminal'"
-                  />
-                  <DesktopBrowserPanel
-                    v-if="desktopBrowserAvailable && activeToolPanel === 'browser'"
-                    @attach="handleBrowserAttachment"
-                  />
-                </div>
-              </template>
-            </div>
-          </aside>
+              <div class="chat-tool-panel-inner">
+                <WorkspaceDiffPreview
+                  v-if="toolPanelStore.workspaceDiff"
+                  :custom-close="closeToolPanelOverlay"
+                />
+                <FilePreview
+                  v-else-if="filesStore.previewFile"
+                  :custom-close="closeToolPanelOverlay"
+                />
+                <SubagentStreamPanel
+                  v-else-if="selectedSubagent"
+                  :stream="selectedSubagentStream"
+                  @close="closeToolPanelOverlay"
+                />
+                <template v-else>
+                  <div class="chat-tool-tabs" role="tablist">
+                    <button
+                      class="chat-tool-tab"
+                      :class="{ active: activeToolPanel === 'files' }"
+                      type="button"
+                      role="tab"
+                      :title="t('drawer.files')"
+                      :aria-label="t('drawer.files')"
+                      :aria-selected="activeToolPanel === 'files'"
+                      @click="activeToolPanel = 'files'"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+                      </svg>
+                    </button>
+                    <button
+                      class="chat-tool-tab"
+                      :class="{ active: activeToolPanel === 'terminal' }"
+                      type="button"
+                      role="tab"
+                      :title="t('drawer.terminal')"
+                      :aria-label="t('drawer.terminal')"
+                      :aria-selected="activeToolPanel === 'terminal'"
+                      @click="activeToolPanel = 'terminal'"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="3" y="4" width="18" height="16" rx="2" />
+                        <path d="m7 9 3 3-3 3M13 15h4" />
+                      </svg>
+                    </button>
+                    <button
+                      v-if="desktopBrowserAvailable"
+                      class="chat-tool-tab"
+                      :class="{ active: activeToolPanel === 'browser' }"
+                      type="button"
+                      role="tab"
+                      :title="t('browser.title')"
+                      :aria-label="t('browser.title')"
+                      :aria-selected="activeToolPanel === 'browser'"
+                      @click="activeToolPanel = 'browser'"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="3" y="4" width="18" height="16" rx="2" />
+                        <path d="M3 9h18" />
+                        <circle cx="6.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                        <circle cx="9.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div class="chat-tool-content">
+                    <FilesPanel
+                      v-show="activeToolPanel === 'files'"
+                      :workspace-session-id="activeWorkspaceSessionId"
+                      :workspace="activeWorkspacePath"
+                      @attach="handleWorkspaceFileAttach"
+                    />
+                    <TerminalPanel
+                      v-show="activeToolPanel === 'terminal'"
+                      :visible="showToolPanel && activeToolPanel === 'terminal'"
+                    />
+                    <DesktopBrowserPanel
+                      v-if="desktopBrowserAvailable && activeToolPanel === 'browser'"
+                      :visible="toolPanelTransitionReady"
+                      @attach="handleBrowserAttachment"
+                    />
+                  </div>
+                </template>
+              </div>
+            </aside>
+          </Transition>
         </div>
       </template>
       <ConversationMonitorPane
@@ -3001,11 +3111,11 @@ async function handleSessionModelCustomSubmit() {
 }
 
 .session-model-group-items {
-  padding-left: 8px;
+  padding-inline-start: 8px;
 }
 
 .session-moa-items {
-  padding-left: 0;
+  padding-inline-start: 0;
 }
 
 .session-model-item {
@@ -3083,7 +3193,7 @@ async function handleSessionModelCustomSubmit() {
   font-weight: 600;
   padding: 1px 5px;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   letter-spacing: 0.03em;
 }
 
@@ -3156,8 +3266,8 @@ async function handleSessionModelCustomSubmit() {
 
   &.collapsed {
     width: 0;
-    margin-left: 0;
-    margin-right: 0;
+    margin-inline-start: 0;
+    margin-inline-end: 0;
     border: none;
     box-shadow: none;
     opacity: 0;
@@ -3457,6 +3567,15 @@ async function handleSessionModelCustomSubmit() {
   letter-spacing: 0.08em;
 }
 
+.session-group-config {
+  margin-inline-start: auto;
+  border: 0;
+  background: transparent;
+  color: $text-muted;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
 .session-group-count {
   font-size: 10px;
   color: $text-muted;
@@ -3538,7 +3657,7 @@ async function handleSessionModelCustomSubmit() {
   position: relative;
 
   &--sidebar-collapsed {
-    margin-left: 10px;
+    margin-inline-start: 10px;
   }
 
   @media (max-width: $breakpoint-mobile) {
@@ -3697,7 +3816,7 @@ async function handleSessionModelCustomSubmit() {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
 }
 
 @media (max-width: $breakpoint-mobile) {
@@ -3757,16 +3876,38 @@ async function handleSessionModelCustomSubmit() {
   flex: 0 0 auto;
   min-width: 320px;
   max-width: 100%;
+  max-inline-size: 100%;
+  box-sizing: border-box;
   background: $bg-card;
-  border-left: 1px solid $border-color;
+  border-inline-start: 1px solid $border-color;
   display: flex;
   min-height: 0;
   overflow: visible;
 }
 
+.tool-panel-enter-active,
+.tool-panel-leave-active {
+  overflow: hidden;
+  pointer-events: none;
+  will-change: width, min-width, opacity;
+  transition:
+    width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+    min-width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.16s ease,
+    border-color 0.16s ease;
+}
+
+.tool-panel-enter-from,
+.tool-panel-leave-to {
+  width: 0 !important;
+  min-width: 0;
+  opacity: 0;
+  border-inline-start-color: transparent;
+}
+
 .chat-tool-resize-handle {
   position: absolute;
-  left: -7px;
+  inset-inline-start: -7px;
   top: 0;
   bottom: 0;
   width: 14px;
@@ -3776,7 +3917,7 @@ async function handleSessionModelCustomSubmit() {
   &::after {
     content: "";
     position: absolute;
-    left: 6px;
+    inset-inline-start: 6px;
     top: 0;
     bottom: 0;
     width: 1px;
@@ -3790,7 +3931,7 @@ async function handleSessionModelCustomSubmit() {
   &::before {
     content: "";
     position: absolute;
-    left: 1px;
+    inset-inline-start: 1px;
     top: 50%;
     width: 12px;
     height: 38px;
@@ -3826,33 +3967,52 @@ async function handleSessionModelCustomSubmit() {
 
 .chat-tool-panel-inner {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: $bg-main-surface;
 }
 
 .chat-tool-tabs {
   display: flex;
+  flex-direction: column;
   align-items: center;
   flex-shrink: 0;
-  gap: 6px;
-  padding: 8px 10px;
-  border-bottom: 1px solid $border-color;
+  order: 2;
+  width: 48px;
+  height: 100%;
+  gap: 4px;
+  padding: 8px 6px;
+  border-inline-start: 1px solid $border-color;
+  background: $bg-sidebar-surface;
+  box-sizing: border-box;
 }
 
 .chat-tool-tab {
-  height: 30px;
-  padding: 0 12px;
+  position: relative;
+  width: 36px;
+  height: 36px;
+  padding: 0;
   border: none;
   border-radius: $radius-sm;
   background: transparent;
   color: $text-secondary;
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
+  display: grid;
+  place-items: center;
   transition: all $transition-fast;
+
+  svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
 
   &:hover {
     color: $text-primary;
@@ -3862,14 +4022,27 @@ async function handleSessionModelCustomSubmit() {
   &.active {
     color: var(--accent-primary);
     background: rgba(var(--accent-primary-rgb), 0.12);
+
+    &::after {
+      content: "";
+      position: absolute;
+      right: -6px;
+      top: 9px;
+      bottom: 9px;
+      width: 2px;
+      border-radius: 2px 0 0 2px;
+      background: var(--accent-primary);
+    }
   }
 }
 
 .chat-tool-content {
+  order: 1;
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: $bg-main-surface;
 }
 
 .chat-tool-content > * {
@@ -3886,13 +4059,41 @@ async function handleSessionModelCustomSubmit() {
     z-index: 70;
     left: 0;
     width: 100% !important;
+    max-width: 100vw !important;
+    max-inline-size: 100vw;
     min-width: 0;
-    border-left: none;
+    box-sizing: border-box;
+    border-inline-start: none;
     box-shadow: none;
   }
 
   .chat-tool-resize-handle {
     display: none;
+  }
+
+  .tool-panel-enter-active,
+  .tool-panel-leave-active {
+    transition:
+      transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      opacity 0.16s ease;
+  }
+
+  .tool-panel-enter-from,
+  .tool-panel-leave-to {
+    width: 100% !important;
+    transform: translateX(100%);
+  }
+
+  .tool-panel-enter-from:dir(rtl),
+  .tool-panel-leave-to:dir(rtl) {
+    transform: translateX(-100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-panel-enter-active,
+  .tool-panel-leave-active {
+    transition-duration: 0.01ms;
   }
 }
 
@@ -4009,7 +4210,7 @@ async function handleSessionModelCustomSubmit() {
 
 .workspace-default-badge {
   display: inline-block;
-  margin-left: 6px;
+  margin-inline-start: 6px;
   padding: 1px 6px;
   font-size: 10px;
   font-weight: 600;

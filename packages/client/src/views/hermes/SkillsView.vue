@@ -483,7 +483,7 @@ function handleSkillSaved() {
   gap: 6px;
   flex: 1;
   flex-wrap: wrap;
-  margin-left: 16px;
+  margin-inline-start: 16px;
 }
 
 .header-actions {
@@ -654,7 +654,7 @@ function handleSkillSaved() {
 
 .skills-sidebar {
   width: 280px;
-  border-right: 1px solid $border-color;
+  border-inline-end: 1px solid $border-color;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

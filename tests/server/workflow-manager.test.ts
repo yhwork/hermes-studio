@@ -1,10 +1,22 @@
 import { afterAll, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const workflowManagerTestDbDir = mkdtempSync(join(tmpdir(), 'hermes-workflow-manager-'))
+const originalWorkflowManagerTestDbDir = process.env.HERMES_WEB_UI_TEST_DB_DIR
+const originalWorkflowManagerWebUiHome = process.env.HERMES_WEB_UI_HOME
+const originalWorkflowManagerStateDir = process.env.HERMES_WEBUI_STATE_DIR
+const workflowManagerTestRoot = mkdtempSync(join(tmpdir(), 'hermes-workflow-manager-'))
+const workflowManagerTestDbDir = join(workflowManagerTestRoot, 'db')
+const workflowManagerTestHome = join(workflowManagerTestRoot, 'home')
 process.env.HERMES_WEB_UI_TEST_DB_DIR = workflowManagerTestDbDir
+process.env.HERMES_WEB_UI_HOME = workflowManagerTestHome
+process.env.HERMES_WEBUI_STATE_DIR = workflowManagerTestHome
+
+function restoreEnvironmentVariable(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name]
+  else process.env[name] = value
+}
 
 const chatRunMock = vi.hoisted(() => ({
   runAndWait: vi.fn(),
@@ -47,14 +59,30 @@ vi.mock('../../packages/server/src/db/hermes/session-store', async (importOrigin
 afterAll(async () => {
   const { closeDb } = await import('../../packages/server/src/db/index')
   closeDb()
-  delete process.env.HERMES_WEB_UI_TEST_DB_DIR
-  rmSync(workflowManagerTestDbDir, { recursive: true, force: true })
+  restoreEnvironmentVariable('HERMES_WEB_UI_TEST_DB_DIR', originalWorkflowManagerTestDbDir)
+  restoreEnvironmentVariable('HERMES_WEB_UI_HOME', originalWorkflowManagerWebUiHome)
+  restoreEnvironmentVariable('HERMES_WEBUI_STATE_DIR', originalWorkflowManagerStateDir)
+  rmSync(workflowManagerTestRoot, { recursive: true, force: true })
 })
 
 describe('workflow manager', () => {
-  it('uses an isolated SQLite directory for this suite', async () => {
+  it('isolates both SQLite and default workflow workspaces for this suite', async () => {
+    const { config } = await import('../../packages/server/src/config')
     const { getStoragePath } = await import('../../packages/server/src/db/index')
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { createWorkflow, deleteWorkflow } = await import('../../packages/server/src/db/hermes/workflow-store')
+
     expect(getStoragePath()).toBe(join(workflowManagerTestDbDir, 'hermes-web-ui.db'))
+    expect(config.appHome).toBe(workflowManagerTestHome)
+
+    initAllStores()
+    const workflow = createWorkflow({ name: 'Isolated workspace', profile: 'default' })
+    try {
+      expect(workflow.workspace).toBe(join(workflowManagerTestHome, 'workflow', 'default', workflow.id))
+      expect(existsSync(workflow.workspace!)).toBe(true)
+    } finally {
+      deleteWorkflow(workflow.id)
+    }
   })
 
   it('returns a server-wide singleton instance', async () => {
@@ -1172,10 +1200,56 @@ describe('workflow manager', () => {
     try {
       const runPromise = manager.runNow(workflow.id)
       await vi.waitFor(() => expect(manager.getRuntimeStatus(workflow.id).nodeStatuses.header).toBe('pending_approval'))
+      expect(manager.getRuntimeStatus(workflow.id).pendingApprovals).toEqual([
+        { nodeId: 'header', executionId: 'header@loop:retry:0' },
+      ])
       const runId = manager.getRuntimeStatus(workflow.id).runId!
       expect(manager.approveNode(workflow.id, runId, 'header', true, 'header@loop:retry:0')).toBe(true)
-      await vi.waitFor(() => expect(manager.approveNode(workflow.id, runId, 'header', true, 'header@loop:retry:1')).toBe(true))
+      await vi.waitFor(() => expect(manager.getRuntimeStatus(workflow.id).pendingApprovals).toEqual([
+        { nodeId: 'header', executionId: 'header@loop:retry:1' },
+      ]))
+      expect(manager.approveNode(workflow.id, runId, 'header', true, 'header@loop:retry:1')).toBe(true)
       expect((await runPromise).run.status).toBe('completed')
+    } finally { await manager.delete(workflow.id) }
+  })
+
+  it('atomically rejects simultaneous runs of the same workflow before either can overwrite approval status', async () => {
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { listActiveWorkflowRuns } = await import('../../packages/server/src/db/hermes/workflow-run-store')
+    const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
+    initAllStores()
+    const manager = new WorkflowManager()
+    chatRunMock.runAndWait.mockReset().mockResolvedValue({ ok: true, output: 'review' })
+    const workflow = manager.create({
+      name: `Concurrent approval ${Date.now()}`, profile: 'default',
+      nodes: [{ id: 'review', type: 'agent', data: { title: 'Review', agent: 'hermes', input: 'review', approvalRequired: true } }],
+      edges: [],
+    })
+    try {
+      const attempts = [manager.runNow(workflow.id), manager.runNow(workflow.id)]
+      const observed = attempts.map(attempt => attempt.then(
+        value => ({ status: 'fulfilled' as const, value }),
+        reason => ({ status: 'rejected' as const, reason }),
+      ))
+      await vi.waitFor(() => expect(manager.getRuntimeStatus(workflow.id).nodeStatuses.review).toBe('pending_approval'))
+      const firstRunId = manager.getRuntimeStatus(workflow.id).runId!
+      const rejected = await Promise.race(observed.map(async attempt => {
+        const result = await attempt
+        return result.status === 'rejected' ? result.reason : null
+      }))
+
+      expect(rejected).toMatchObject({ message: 'workflow is already running', status: 409 })
+      expect(listActiveWorkflowRuns().filter(run => run.workflow_id === workflow.id)).toHaveLength(1)
+      expect(manager.getRuntimeStatus(workflow.id)).toMatchObject({
+        runId: firstRunId,
+        nodeStatuses: { review: 'pending_approval' },
+        pendingApprovals: [{ nodeId: 'review', executionId: 'review' }],
+      })
+
+      expect(manager.approveNode(workflow.id, firstRunId, 'review', true, 'review')).toBe(true)
+      const settled = await Promise.allSettled(attempts)
+      expect(settled.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+      expect(settled.filter(result => result.status === 'rejected')).toHaveLength(1)
     } finally { await manager.delete(workflow.id) }
   })
 
@@ -2070,7 +2144,12 @@ describe('workflow manager', () => {
   it('finalizes a loop exit target when its approval reaches the shared deadline', async () => {
     const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
     const manager = new WorkflowManager()
-    chatRunMock.runAndWait.mockReset().mockResolvedValue({ ok: true, output: 'stop' })
+    let now = 1_000
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    chatRunMock.runAndWait.mockReset().mockImplementation(async () => {
+      now += 5
+      return { ok: true, output: 'stop' }
+    })
     const workflow = manager.create({
       name: `Exit approval deadline ${Date.now()}`, profile: 'default',
       nodes: [
@@ -2091,7 +2170,7 @@ describe('workflow manager', () => {
         ['header', 'completed', null], ['latch', 'completed', null], ['publish', 'failed', 'workflow run timed out after 20ms'],
       ])
       expect(manager.approveNode(workflow.id, result.run.id, 'publish', true)).toBe(false)
-    } finally { await manager.delete(workflow.id) }
+    } finally { nowSpy.mockRestore(); await manager.delete(workflow.id) }
   })
 
   it('keeps a canceled loop exit target canceled when its agent fails late', async () => {

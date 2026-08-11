@@ -15,13 +15,27 @@ import {
   saveSttProviderSetting,
   SttSettingsValidationError,
   type StoredSttProvider,
+  type SttStoredSecrets,
+  type SttStoredSettings,
 } from '../../db/hermes/stt-settings-store'
 import { config } from '../../config'
 import { SttProviderConfigError, transcribeWithProvider } from '../../services/hermes/stt-providers'
 import { SttNoSpeechDetectedError } from '../../services/hermes/stt-providers/types'
 import { logger } from '../../services/logger'
 import { getActiveGlobalAgentServer } from '../../services/global-agent/server'
+import { normalizeMcuAgentRuntime } from '../../services/global-agent/mcu-agent-runtime'
 import { MCU_TTS_SAMPLE_RATE, mcuPromptText, mcuPromptUrl } from '../../services/hermes/mcu-prompts'
+import { syncVoiceConfigToHermesProfile } from '../../services/hermes/voice-config-sync'
+import { listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
+import {
+  cancelLocalSttStreamSession,
+  createLocalSttStreamSession,
+  finishLocalSttStreamSession,
+  getLocalSttModelStatus,
+  LOCAL_STT_MODEL_ID,
+  LocalSttStreamSessionError,
+  pushLocalSttStreamAudio,
+} from '../../services/hermes/local-stt-model-manager'
 
 const MAX_STT_UPLOAD_SIZE = 50 * 1024 * 1024
 const MCU_STT_TIMEOUT_MS = 120_000
@@ -57,10 +71,19 @@ function requestedProfile(ctx: Context): string {
   return (ctx.state?.profile?.name || queryProfile || headerProfile || 'default').trim() || 'default'
 }
 
+function requestedVoiceProxyProfile(ctx: Context): string | null {
+  const profile = String(ctx.params?.profile || '').trim()
+  return profile && listProfileNamesFromDisk().includes(profile) ? profile : null
+}
+
 function bearerToken(ctx: Context): string {
   const header = ctx.get?.('authorization') || ''
   const match = header.match(/^Bearer\s+(.+)$/i)
   return match?.[1]?.trim() || ''
+}
+
+function localRuntimeSetting(): { settings: SttStoredSettings; secrets: SttStoredSecrets } {
+  return { settings: { model: LOCAL_STT_MODEL_ID }, secrets: {} }
 }
 
 function resolveSttProfileStatus(profile: string) {
@@ -80,6 +103,16 @@ function resolveSttProfileStatus(profile: string) {
       configured: false,
       activeProvider,
       reason: 'active_stt_provider_unsupported',
+    }
+  }
+
+  if (activeProvider === 'local') {
+    const model = getLocalSttModelStatus()
+    return {
+      profile,
+      configured: model.usable,
+      activeProvider,
+      reason: model.usable ? null : 'local_stt_model_unavailable',
     }
   }
 
@@ -346,6 +379,7 @@ export async function saveSettings(ctx: Context) {
       ? saveActiveSttProvider(profile, storedProvider)
       : saveActiveSttProvider(profile, assertActiveSttProvider(String(body.activeProvider)))
 
+    await syncVoiceConfigToHermesProfile(profile)
     ctx.body = { setting, activeProvider }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -387,6 +421,7 @@ export async function deleteSecret(ctx: Context) {
     const profile = requestedProfile(ctx)
     const storedProvider = assertStoredSttProvider(provider)
     const setting = clearStoredSttSecret(profile, storedProvider, secretName)
+    await syncVoiceConfigToHermesProfile(profile)
     ctx.body = { success: true, setting }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -408,6 +443,7 @@ export async function deleteProvider(ctx: Context) {
     const activeProvider = currentActiveProvider === storedProvider
       ? saveActiveSttProvider(profile, 'browser')
       : currentActiveProvider
+    await syncVoiceConfigToHermesProfile(profile)
     ctx.body = { success: true, deleted, activeProvider }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -423,7 +459,21 @@ export async function saveActiveProvider(ctx: Context) {
 
   try {
     const profile = requestedProfile(ctx)
-    const activeProvider = saveActiveSttProvider(profile, assertActiveSttProvider(String(body?.provider || '')))
+    const requestedProvider = assertActiveSttProvider(String(body?.provider || ''))
+    if (requestedProvider === 'local') {
+      const model = getLocalSttModelStatus()
+      if (!model.usable) {
+        ctx.status = 409
+        ctx.body = { error: model.validationError || 'Local STT model is not installed and usable' }
+        return
+      }
+      saveSttProviderSetting(profile, 'local', {
+        settings: { model: LOCAL_STT_MODEL_ID },
+        secrets: {},
+      })
+    }
+    const activeProvider = saveActiveSttProvider(profile, requestedProvider)
+    await syncVoiceConfigToHermesProfile(profile)
     ctx.body = { activeProvider }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -433,6 +483,116 @@ export async function saveActiveProvider(ctx: Context) {
 
 function resolveStoredProvider(fields: Record<string, string>): StoredSttProvider {
   return assertStoredSttProvider(fields.provider || '')
+}
+
+function localStreamOwnerKey(userId: number, ctx: Context): string {
+  return `${userId}:${requestedProfile(ctx)}`
+}
+
+function requireActiveLocalStt(ctx: Context): boolean {
+  const profile = requestedProfile(ctx)
+  if (getActiveSttProvider(profile) !== 'local') {
+    ctx.status = 409
+    ctx.body = { error: 'Local STT is not the active provider for this profile' }
+    return false
+  }
+
+  const model = getLocalSttModelStatus()
+  if (!model.usable) {
+    ctx.status = 409
+    ctx.body = { error: model.validationError || 'Local STT model is not installed and usable' }
+    return false
+  }
+  return true
+}
+
+function handleLocalStreamError(ctx: Context, error: unknown): void {
+  if (isAbortError(error)) {
+    ctx.status = 499
+    ctx.body = { error: 'STT request aborted' }
+    return
+  }
+  if (error instanceof LocalSttStreamSessionError) {
+    ctx.status = 404
+    ctx.body = { error: error.message }
+    return
+  }
+
+  const detail = error instanceof Error ? error.message : String(error)
+  if (detail.startsWith('Local STT accepts') || detail.startsWith('Local STT raw PCM')) {
+    ctx.status = 400
+    ctx.body = { error: detail }
+    return
+  }
+  ctx.status = 502
+  ctx.body = { error: detail ? `Local STT streaming failed: ${detail}` : 'Local STT streaming failed' }
+}
+
+export async function startLocalStream(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId || !requireActiveLocalStt(ctx)) return
+
+  try {
+    ctx.body = await createLocalSttStreamSession(localStreamOwnerKey(userId, ctx))
+  } catch (error) {
+    handleLocalStreamError(ctx, error)
+  }
+}
+
+export async function pushLocalStreamChunk(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId || !requireActiveLocalStt(ctx)) return
+
+  const audio = await readRawAudioBody(ctx)
+  if ('error' in audio) {
+    ctx.status = audio.status
+    ctx.body = { error: audio.error }
+    return
+  }
+
+  const controller = createRequestAbortController(ctx)
+  try {
+    ctx.body = await pushLocalSttStreamAudio(
+      ctx.params.sessionId || '',
+      localStreamOwnerKey(userId, ctx),
+      audio,
+      ctx.get('content-type') || 'audio/wav',
+      controller.signal,
+    )
+  } catch (error) {
+    handleLocalStreamError(ctx, error)
+  }
+}
+
+export async function finishLocalStream(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId) return
+
+  const controller = createRequestAbortController(ctx)
+  try {
+    ctx.body = await finishLocalSttStreamSession(
+      ctx.params.sessionId || '',
+      localStreamOwnerKey(userId, ctx),
+      controller.signal,
+    )
+  } catch (error) {
+    handleLocalStreamError(ctx, error)
+  }
+}
+
+export async function cancelLocalStream(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId) return
+
+  try {
+    await cancelLocalSttStreamSession(
+      ctx.params.sessionId || '',
+      localStreamOwnerKey(userId, ctx),
+    )
+    ctx.body = { success: true }
+  } catch (error) {
+    handleLocalStreamError(ctx, error)
+  }
 }
 
 export async function transcribe(ctx: Context) {
@@ -462,13 +622,16 @@ export async function transcribe(ctx: Context) {
   }
 
   const storedSetting = getSttProviderSetting(requestedProfile(ctx), provider, { includeSecrets: true })
-  if (!storedSetting) {
+  const runtimeSetting = storedSetting || (provider === 'local' && getLocalSttModelStatus().usable
+    ? localRuntimeSetting()
+    : null)
+  if (!runtimeSetting) {
     ctx.status = 400
     ctx.body = { error: `STT settings are required for provider ${provider}` }
     return
   }
 
-  if (!storedSetting.secrets.apiKey) {
+  if (provider !== 'local' && !runtimeSetting.secrets.apiKey) {
     ctx.status = 400
     ctx.body = { error: `STT settings are incomplete for provider ${provider}` }
     return
@@ -482,8 +645,8 @@ export async function transcribe(ctx: Context) {
       audio: audio.data,
       fileName: audio.filename || 'audio',
       mimeType: audio.contentType || 'application/octet-stream',
-      settings: storedSetting.settings,
-      secrets: storedSetting.secrets,
+      settings: runtimeSetting.settings,
+      secrets: runtimeSetting.secrets,
       signal: controller.signal,
     })
 
@@ -510,6 +673,88 @@ export async function transcribe(ctx: Context) {
     ctx.status = 502
     const detail = error instanceof Error ? error.message : ''
     ctx.body = { error: detail ? `STT transcription failed: ${detail}` : 'STT transcription failed' }
+  }
+}
+
+/**
+ * OpenAI-compatible STT endpoint used by the Hermes `hermes-studio` command
+ * provider. The profile is encoded in the URL written to that profile's
+ * config.yaml, so no process-global profile inference is needed.
+ */
+export async function transcribeVoiceProxy(ctx: Context) {
+  const profile = requestedVoiceProxyProfile(ctx)
+  if (!profile) {
+    ctx.status = 404
+    ctx.body = { error: 'unknown Hermes profile' }
+    return
+  }
+
+  const parsed = await readMultipartBody(ctx)
+  if ('error' in parsed) {
+    ctx.status = parsed.status
+    ctx.body = { error: parsed.error }
+    return
+  }
+
+  const audio = parsed.files.find(part => part.fieldName === 'file' || part.fieldName === 'audio')
+  if (!audio) {
+    ctx.status = 400
+    ctx.body = { error: 'file is required' }
+    return
+  }
+
+  const activeProvider = getActiveSttProvider(profile)
+  if (!activeProvider || activeProvider === 'browser' || !isStoredSttProvider(activeProvider)) {
+    ctx.status = 409
+    ctx.body = { error: 'no server-backed Web UI STT provider is active' }
+    return
+  }
+
+  const storedSetting = getSttProviderSetting(profile, activeProvider, { includeSecrets: true })
+  const setting = storedSetting || (activeProvider === 'local' && getLocalSttModelStatus().usable
+    ? localRuntimeSetting()
+    : null)
+  if (!setting || (activeProvider !== 'local' && !setting.secrets.apiKey)) {
+    ctx.status = 409
+    ctx.body = { error: 'the active Web UI STT provider is not configured' }
+    return
+  }
+
+  const controller = createRequestAbortController(ctx)
+  try {
+    const result = await transcribeWithProvider({
+      provider: activeProvider,
+      audio: audio.data,
+      fileName: audio.filename || 'audio',
+      mimeType: audio.contentType || 'application/octet-stream',
+      settings: setting.settings,
+      secrets: setting.secrets,
+      signal: controller.signal,
+    })
+    if (parsed.fields.response_format === 'text') {
+      ctx.set('Content-Type', 'text/plain; charset=utf-8')
+      ctx.body = result.text
+    } else {
+      ctx.body = { text: result.text }
+    }
+  } catch (error) {
+    if (isAbortError(error)) {
+      ctx.status = 499
+      ctx.body = { error: 'STT request aborted' }
+      return
+    }
+    if (error instanceof SttProviderConfigError) {
+      ctx.status = 400
+      ctx.body = { error: error.message }
+      return
+    }
+    if (error instanceof SttNoSpeechDetectedError) {
+      ctx.status = 400
+      ctx.body = { error: error.message, code: 'no_speech_detected' }
+      return
+    }
+    ctx.status = 502
+    ctx.body = { error: error instanceof Error ? error.message : 'Hermes Studio transcription failed' }
   }
 }
 
@@ -543,8 +788,11 @@ export async function mcuVoiceTurn(ctx: Context) {
     return
   }
 
-  const storedSetting = getSttProviderSetting(profile, status.activeProvider, { includeSecrets: true })
-  if (!storedSetting?.secrets.apiKey) {
+  const persistedSetting = getSttProviderSetting(profile, status.activeProvider, { includeSecrets: true })
+  const storedSetting = persistedSetting || (status.activeProvider === 'local' && getLocalSttModelStatus().usable
+    ? localRuntimeSetting()
+    : null)
+  if (!storedSetting || (status.activeProvider !== 'local' && !storedSetting.secrets.apiKey)) {
     ctx.body = {
       ok: false,
       profile,
@@ -567,6 +815,7 @@ export async function mcuVoiceTurn(ctx: Context) {
   const interactionId = ctx.get('x-hermes-mcu-interaction-id') || `mcu-voice-${Date.now()}`
   const token = bearerToken(ctx)
   const clientId = ctx.get('x-hermes-mcu-device-id') || undefined
+  const agentRuntime = normalizeMcuAgentRuntime(ctx.get('x-hermes-mcu-agent-runtime'))
   let debugAudioPath = ''
   let debugMetadataPath = ''
   try {
@@ -660,16 +909,34 @@ export async function mcuVoiceTurn(ctx: Context) {
         interactionId,
         transcript,
         clientId,
+        agentRuntime,
       })
     } catch (error) {
+      const globalAgentServer = getActiveGlobalAgentServer()
+      if (error instanceof SttNoSpeechDetectedError) {
+        logger.info({
+          userId,
+          profile,
+          provider,
+          audioBytes: audio.length,
+          contentType,
+          debugAudioPath,
+        }, '[mcu-stt] voice turn completed without detected speech')
+        globalAgentServer?.emitMcuEvent({
+          type: 'interaction.status',
+          interactionId,
+          status: 'completed',
+          text: '',
+        }, { clientId })
+        return
+      }
+
       const detail = error instanceof Error ? error.message : String(error)
       const text = isAbortError(error)
         ? 'STT request timed out'
         : error instanceof SttProviderConfigError
           ? error.message
-          : error instanceof SttNoSpeechDetectedError
-            ? error.message
-            : detail || 'MCU voice turn failed'
+          : detail || 'MCU voice turn failed'
       logger.warn({
         userId,
         profile,
@@ -679,7 +946,6 @@ export async function mcuVoiceTurn(ctx: Context) {
         debugAudioPath,
         error: detail,
       }, '[mcu-stt] voice turn failed')
-      const globalAgentServer = getActiveGlobalAgentServer()
       globalAgentServer?.emitMcuEvent({
         type: 'interaction.status',
         interactionId,

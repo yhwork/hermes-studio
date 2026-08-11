@@ -19,7 +19,7 @@ import PrivacySettings from "@/components/hermes/settings/PrivacySettings.vue";
 import ModelSettings from "@/components/hermes/settings/ModelSettings.vue";
 import AccountSettings from "@/components/hermes/settings/AccountSettings.vue";
 import UserManagementSettings from "@/components/hermes/settings/UserManagementSettings.vue";
-import VoiceSettings from "@/components/hermes/settings/VoiceSettings.vue";
+import WebhookSettings from "@/components/hermes/settings/WebhookSettings.vue";
 import { isStoredSuperAdmin } from "@/api/client";
 import { useProfilesStore } from "@/stores/hermes/profiles";
 
@@ -34,6 +34,7 @@ const activeTab = ref("account");
 const validTabs = computed(() => new Set([
   "account",
   ...(canManageUsers ? ["users"] : []),
+  ...(canManageUsers ? ["webhooks"] : []),
   "display",
   "proxy",
   "agent",
@@ -42,7 +43,6 @@ const validTabs = computed(() => new Set([
   "session",
   "privacy",
   "models",
-  "voice",
 ]));
 
 function normalizeTab(value: unknown): string {
@@ -61,6 +61,16 @@ function handleTabUpdate(tab: string) {
 }
 
 watch(() => route.query.tab, (tab) => {
+  if (tab === "voice") {
+    void router.replace({
+      name: "hermes.models",
+      query: {
+        ...route.query,
+        tab: "tts",
+      },
+    });
+    return;
+  }
   activeTab.value = normalizeTab(tab);
 }, { immediate: true });
 
@@ -95,6 +105,9 @@ onMounted(() => {
           <NTabPane v-if="canManageUsers" name="users" :tab="t('settings.tabs.users')">
             <UserManagementSettings />
           </NTabPane>
+          <NTabPane v-if="canManageUsers" name="webhooks" :tab="t('settings.tabs.webhooks')">
+            <WebhookSettings />
+          </NTabPane>
           <NTabPane name="display" :tab="t('settings.tabs.display')">
             <DisplaySettings />
           </NTabPane>
@@ -119,9 +132,6 @@ onMounted(() => {
           </NTabPane>
           <NTabPane name="models" :tab="t('settings.tabs.models')">
             <ModelSettings />
-          </NTabPane>
-          <NTabPane name="voice" :tab="t('settings.tabs.voice')">
-            <VoiceSettings />
           </NTabPane>
         </NTabs>
       </NSpin>
