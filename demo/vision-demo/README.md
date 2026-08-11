@@ -165,11 +165,14 @@ curl -X POST http://localhost:8791/agent \
     "env": {
       "VISION_API_KEY": "sk-xxx",
       "VISION_BASE_URL": "https://tc-paperhub.diezhi.net/v1",
-      "VISION_MODEL": "doubao-seed-1-6-vision"
+      "VISION_MODEL": "doubao-seed-1-6-vision",
+      "AGENT_MODEL_NAME": "doubao-seed-1-6"
     }
   }
 }
 ```
+
+> `AGENT_MODEL_KEY` / `AGENT_MODEL_BASE` 默认复用 `VISION_*`（同一网关同一 key），只需单独指定 `AGENT_MODEL_NAME`。若 agent 走不同网关才需另填。
 
 **URL 模式（JSON，需先 `npm start`）：**
 
@@ -198,6 +201,7 @@ mcp_servers:
       VISION_API_KEY: sk-xxx
       VISION_BASE_URL: https://tc-paperhub.diezhi.net/v1
       VISION_MODEL: doubao-seed-1-6-vision
+      AGENT_MODEL_NAME: doubao-seed-1-6
 ```
 
 > ⚠ stdio 模式必须用**绝对路径**（node.exe + tsx cli + mcp.ts）。
@@ -218,7 +222,8 @@ mcp_servers:
       "env": {
         "VISION_API_KEY": "sk-xxx",
         "VISION_BASE_URL": "https://tc-paperhub.diezhi.net/v1",
-        "VISION_MODEL": "doubao-seed-1-6-vision"
+        "VISION_MODEL": "doubao-seed-1-6-vision",
+        "AGENT_MODEL_NAME": "doubao-seed-1-6"
       }
     }
   }
@@ -307,11 +312,15 @@ npm run bundle
 
 ### Agent 模型（可选，多步推理用）
 
+> 与视觉模型独立配置，不配则继承 hermes 主 agent 或退回 local 兜底。
+
 | 变量 | 说明 |
 |------|------|
-| `AGENT_MODEL_KEY` | LLM API key |
-| `AGENT_MODEL_BASE` | LLM base URL |
-| `AGENT_MODEL_NAME` | LLM 模型名 |
+| `AGENT_MODEL_KEY` | LLM API key（回退顺序：`OPENAI_API_KEY` → `VISION_API_KEY` → `PAPERHUB_API_KEY`） |
+| `AGENT_MODEL_BASE` | LLM base URL（回退：`OPENAI_BASE_URL` → `VISION_BASE_URL`） |
+| `AGENT_MODEL_NAME` | LLM 模型名（回退：`OPENAI_MODEL`；**不回退 `VISION_MODEL`**，视觉模型不能当文本模型用） |
+| `AGENT_MODEL_PROVIDER` | 提供商类型，如 `openai` / `anthropic` / `deepseek`（影响请求风格） |
+| `AGENT_MODEL_API_MODE` | 协议：`chat_completions` / `codex_responses` / `anthropic_messages` |
 
 ### 服务
 

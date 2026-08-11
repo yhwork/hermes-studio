@@ -14,6 +14,8 @@ import SessionListItem from '@/components/hermes/chat/SessionListItem.vue'
 import OutlinePanel from '@/components/hermes/chat/OutlinePanel.vue'
 import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
 import PageSidebarFooter from '@/components/layout/PageSidebarFooter.vue'
+import ManageInlinePanel from '@/components/hermes/chat/ManageInlinePanel.vue'
+import { useManageInlineView } from '@/composables/useManageInlineView'
 import { batchDeleteSessions, deleteSession, fetchHermesSessionGroups, fetchHermesSessionPage, fetchHermesSession, fetchSessionMessagesPage, importHermesSession, unarchiveSession, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 
 const appStore = useAppStore()
@@ -23,6 +25,7 @@ const message = useMessage()
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
+const { inlineViewComponent: inlineManageComponent, inlineViewTitle: inlineManageTitle, closeInlineView: closeInlineManage } = useManageInlineView()
 
 const routeSessionId = computed(() => {
   const value = route.params.sessionId
@@ -1063,6 +1066,12 @@ function handleBatchDeleteConfirm() {
           @navigate="handleOutlineNavigate"
         />
       </div>
+
+      <ManageInlinePanel
+        :title="inlineManageTitle"
+        :component="inlineManageComponent"
+        @close="closeInlineManage"
+      />
     </div>
   </div>
 </template>
@@ -1293,6 +1302,7 @@ function handleBatchDeleteConfirm() {
   border: 1px solid $border-color;
   border-radius: 14px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+  position: relative;
 
   &--sidebar-collapsed {
     margin-inline-start: 10px;

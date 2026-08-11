@@ -23,6 +23,8 @@ import FolderPicker from '@/components/hermes/chat/FolderPicker.vue'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
 import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
 import SettingsCircuitBadge from '@/components/layout/SettingsCircuitBadge.vue'
+import ManageInlinePanel from '@/components/hermes/chat/ManageInlinePanel.vue'
+import { useManageInlineView } from '@/composables/useManageInlineView'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { Attachment } from '@/stores/hermes/chat'
 import type { GroupChatMention, MemberInfo, RoomAgent, RoomInfo, RoomSummaryAnchor, RoomSummaryConfig, RoomSummaryState } from '@/api/hermes/group-chat'
@@ -68,6 +70,7 @@ const store = useGroupChatStore()
 const profilesStore = useProfilesStore()
 const filesStore = useFilesStore()
 const toolPanelStore = useToolPanelStore()
+const { inlineViewComponent: inlineManageComponent, inlineViewTitle: inlineManageTitle, closeInlineView: closeInlineManage } = useManageInlineView()
 
 const showSidebar = ref(!props.standalone && window.innerWidth > 768)
 watch(
@@ -2280,6 +2283,12 @@ async function handleClarify(response?: string) {
                 </div>
                 <p>{{ t('groupChat.selectOrCreate') }}</p>
             </div>
+
+            <ManageInlinePanel
+                :title="inlineManageTitle"
+                :component="inlineManageComponent"
+                @close="closeInlineManage"
+            />
         </div>
 
         <NDrawer v-model:show="showCreateModal" placement="right" :width="workspacePanelMobile ? '100%' : 520">

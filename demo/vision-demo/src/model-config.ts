@@ -62,11 +62,25 @@ export function loadModelConfig(): ModelConfigWithMode {
     };
   }
 
-  const envKey = (process.env.AGENT_MODEL_KEY ?? process.env.OPENAI_API_KEY ?? "").trim();
-  if (envKey) {
+  // env：agent 专用变量 → OPENAI_* → 复用 VISION_*（同一网关同一 key，仅模型名不同）
+  const envKey = (
+    process.env.AGENT_MODEL_KEY
+    ?? process.env.OPENAI_API_KEY
+    ?? process.env.VISION_API_KEY
+    ?? process.env.PAPERHUB_API_KEY
+    ?? ""
+  ).trim();
+  const envBase = (
+    process.env.AGENT_MODEL_BASE
+    ?? process.env.OPENAI_BASE_URL
+    ?? process.env.VISION_BASE_URL
+    ?? ""
+  ).trim();
+  if (envKey && envBase) {
     return {
       apiKey: envKey,
-      baseURL: (process.env.AGENT_MODEL_BASE ?? process.env.OPENAI_BASE_URL ?? DEFAULTS.baseURL).trim(),
+      baseURL: envBase,
+      // 模型名不回退到 VISION_MODEL（视觉模型不能当 agent 文本模型用）
       model: (process.env.AGENT_MODEL_NAME ?? process.env.OPENAI_MODEL ?? DEFAULTS.model).trim(),
       provider: (process.env.AGENT_MODEL_PROVIDER ?? DEFAULTS.provider).trim(),
       apiMode: process.env.AGENT_MODEL_API_MODE,

@@ -6,7 +6,8 @@
 // The Python agent bridge is single-threaded, so mcp_list queues behind
 // active chat runs (measured 90ms–1.1s). Seeding from this cache lets re-opened
 // panels render instantly, then refresh silently in the background.
-import type { McpServerInfo } from '@/api/hermes/mcp'
+// McpServerInfo 的类型导入放 <script setup>，两个 script 块共享模块作用域，
+// 这里再 import 一次会触发 TS2300 重复标识符。
 interface McpCache {
   servers: McpServerInfo[]
   toolsByServer: Record<string, { name: string; description: string }[]>
